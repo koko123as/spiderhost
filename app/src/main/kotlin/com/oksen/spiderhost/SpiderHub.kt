@@ -52,12 +52,8 @@ object SpiderHub {
         homeKey = home
         enabled = app.getSharedPreferences("spike", Context.MODE_PRIVATE).getStringSet("enabledSites", emptySet())!!.toSet()
         runner = r
-        // The home site's categories are the libraries; keep it a served (netdisk) site.
-        if (enabled.isEmpty() && site(home)?.let { isPan(it) } != true) {
-            sites.firstOrNull { isPan(it) }?.let { homeKey = it.key; DiagLog.w("HUB: 首页站点不是网盘站，改为 ${it.name} [${it.key}]") }
-        }
         val usable = served()
-        DiagLog.w("HUB: 配置 ${all.size} 站，可服务 type-3 csp 站 ${usable.size} 个，启用 ${if (enabled.isEmpty()) "默认（全部网盘站）" else enabled.size.toString()}")
+        DiagLog.w("HUB: 配置 ${all.size} 站，可服务 type-3 csp 站 ${usable.size} 个，启用 ${if (enabled.isEmpty()) "全部" else enabled.size.toString()}")
         val other = all.filterNot { isSupported(it) }
         if (other.isNotEmpty()) DiagLog.w("HUB: 暂不支持（非 type-3 csp）${other.size} 站: ${other.take(30).joinToString { "${it.name}(t=${it.type})" }}")
         r.step("hub: home site $home")
@@ -69,8 +65,8 @@ object SpiderHub {
     fun isSupported(s: TvboxConfig.Site) = s.type == 3 && s.api.startsWith("csp_")
 
     /** Sites in 全部站点, in config order. */
-    /** No saved selection = every netdisk site (the user wants netdisk sources only). */
-    fun served(): List<TvboxConfig.Site> = sites.filter { isSupported(it) && (if (enabled.isEmpty()) isPan(it) else it.key in enabled || it.key == homeKey) }
+    /** Sites in 全部站点, in config order. No saved selection = every site. */
+    fun served(): List<TvboxConfig.Site> = sites.filter { isSupported(it) && (enabled.isEmpty() || it.key in enabled || it.key == homeKey) }
 
     fun site(key: String) = sites.firstOrNull { it.key == key }
 

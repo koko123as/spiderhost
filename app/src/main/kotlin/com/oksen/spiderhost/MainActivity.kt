@@ -82,20 +82,20 @@ class MainActivity : Activity() {
             loadSites(pickEnabled) { all ->
                 val sites = all.filter { SpiderHub.isSupported(it) }
                 val saved = prefs.getStringSet("enabledSites", emptySet())!!
-                val checked = BooleanArray(sites.size) { if (saved.isEmpty()) SpiderHub.isPan(sites[it]) else sites[it].key in saved }
+                val checked = BooleanArray(sites.size) { saved.isEmpty() || sites[it].key in saved }
                 android.app.AlertDialog.Builder(this).setTitle("启用的站点（${sites.size} 个 type-3）")
                     .setMultiChoiceItems(sites.map { "${it.name}  [${it.key}]" }.toTypedArray(), checked) { _, i, on -> checked[i] = on }
                     .setPositiveButton("保存") { _, _ ->
                         val set = sites.filterIndexed { i, _ -> checked[i] }.map { it.key }.toSet()
-                        val store = set
+                        val store = if (set.size == sites.size) emptySet() else set
                         prefs.edit().putStringSet("enabledSites", store).apply()
                         SpiderHub.enabled = store
                         append("\n启用站点: ${set.size} 个\n")
                     }
-                    .setNeutralButton("默认（全部网盘站）") { _, _ ->
+                    .setNeutralButton("全选") { _, _ ->
                         prefs.edit().putStringSet("enabledSites", emptySet()).apply()
                         SpiderHub.enabled = emptySet()
-                        append("\n启用站点: 默认，全部网盘站 ${sites.count { SpiderHub.isPan(it) }} 个\n")
+                        append("\n启用站点: 全部 ${sites.size} 个\n")
                     }
                     .setNegativeButton("取消", null)
                     .show()
