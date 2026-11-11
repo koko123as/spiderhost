@@ -40,7 +40,7 @@ object JellyfinApi {
     private const val SERVER_NAME = "SpiderHost"
     private val base get() = "http://127.0.0.1:${LocalServer.PORT}"
 
-    private val http = OkHttpClient.Builder()
+    private val http = OkHttpClient.Builder().dns(Net.dns)
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
@@ -701,7 +701,7 @@ object JellyfinApi {
     private var imgDir: File? = null
     private const val IMG_DISK_MAX = 50L * 1024 * 1024
 
-    private val imgHttp = OkHttpClient.Builder()
+    private val imgHttp = OkHttpClient.Builder().dns(Net.dns)
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .callTimeout(15, TimeUnit.SECONDS)

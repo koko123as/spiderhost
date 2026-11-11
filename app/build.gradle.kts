@@ -11,8 +11,8 @@ android {
         applicationId = "com.oksen.spiderhost"
         minSdk = 24
         targetSdk = 34
-        versionCode = 13
-        versionName = "0.0.13"
+        versionCode = 14
+        versionName = "0.0.14"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -70,6 +70,8 @@ android {
 dependencies {
     // Libraries type-3 spider jars commonly link against at runtime (host-provided, parent-first).
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Fallback DNS for the host's own clients (Net.kt).
+    implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.12.0")
     implementation("com.google.code.gson:gson:2.11.0")
     implementation("org.jsoup:jsoup:1.17.2")
     implementation("androidx.collection:collection:1.4.0")

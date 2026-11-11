@@ -119,10 +119,10 @@ class MainActivity : Activity() {
         status.addView(statusLine); status.addView(statusDetail)
         col.addView(status, cardLp())
 
-        SpiderHostApp.instance.previousRunReport?.let { report ->
+        SpiderHostApp.instance.previousRunReport?.takeIf { it.startsWith("上次运行没有正常结束") }?.let { report ->
             val warn = card()
             warn.addView(label("上次运行没有正常结束", 15f, bold = true).apply { setTextColor(c(R.color.warn)) })
-            warn.addView(label(report.lineSequence().firstOrNull().orEmpty(), 13f, dim = true).apply { setPadding(0, dp(6), 0, 0) })
+            warn.addView(label(report.lineSequence().first().substringAfter("，") + "\n点此查看日志", 13f, dim = true).apply { setPadding(0, dp(6), 0, 0) })
             warn.setOnClickListener { show(2) }
             col.addView(warn, cardLp())
         }
@@ -334,8 +334,8 @@ class MainActivity : Activity() {
             val img = icon(ic, c(R.color.on_bg_dim))
             pill.addView(img, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER))
             item.addView(pill, LinearLayout.LayoutParams(dp(64), dp(32)))
-            val tv = label(t, 12f, dim = true).apply { setPadding(0, dp(4), 0, 0) }
-            item.addView(tv)
+            val tv = label(t, 12f, dim = true).apply { setPadding(0, dp(4), 0, 0); gravity = Gravity.CENTER }
+            item.addView(tv, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
             item.setOnClickListener { show(i) }
             bar.addView(item, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             item to (img to tv)
@@ -539,7 +539,7 @@ class MainActivity : Activity() {
         Thread {
             val result = runCatching {
                 val req = okhttp3.Request.Builder().url(url).header("User-Agent", "okhttp/3.15").build()
-                val body = okhttp3.OkHttpClient().newCall(req).execute().use { it.body!!.string() }
+                val body = okhttp3.OkHttpClient.Builder().dns(Net.dns).build().newCall(req).execute().use { it.body!!.string() }
                 TvboxConfig.sites(TvboxConfig.parse(TvboxConfig.decodeBody(body)))
             }
             main.post {
@@ -662,13 +662,23 @@ class MainActivity : Activity() {
 
     private fun round(color: Int, radius: Int) = GradientDrawable().apply { setColor(color); cornerRadius = radius.toFloat() }
 
+    /** Body column of a page; [scroll] puts the fixed title above it so the title never scrolls away. */
     private fun pageColumn(title: String) = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL
-        setPadding(dp(20), dp(24), dp(20), dp(16))
-        addView(label(title, 30f, bold = true).apply { setPadding(dp(4), 0, 0, dp(20)) })
+        setPadding(dp(20), dp(4), dp(20), dp(16))
+        tag = title
     }
 
-    private fun scroll(v: View) = ScrollView(this).apply { isFillViewport = true; addView(v) }
+    private fun scroll(v: View): View = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        addView(label(v.tag as? String ?: "", 30f, bold = true).apply { setPadding(dp(24), dp(24), dp(24), dp(16)) },
+            LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        addView(ScrollView(this@MainActivity).apply {
+            isFillViewport = true
+            descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+            addView(v)
+        }, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+    }
 
     private fun card() = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL

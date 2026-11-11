@@ -19,7 +19,7 @@ class PlayProbe(
     private val step: (String) -> Unit,
     private val callFn: (String, ClassLoader, () -> String?) -> String?,
 ) {
-    private val http = OkHttpClient.Builder()
+    private val http = OkHttpClient.Builder().dns(Net.dns)
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .followRedirects(false)

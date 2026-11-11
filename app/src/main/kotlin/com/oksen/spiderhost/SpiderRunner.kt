@@ -44,7 +44,7 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         val serve: Boolean = false,
     )
 
-    private val http = OkHttpClient.Builder()
+    private val http = OkHttpClient.Builder().dns(Net.dns)
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()

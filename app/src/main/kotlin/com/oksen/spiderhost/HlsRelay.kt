@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit
  */
 object HlsRelay {
 
-    private val http = OkHttpClient.Builder()
+    private val http = OkHttpClient.Builder().dns(Net.dns)
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
