@@ -1,0 +1,17 @@
+SpiderHost (feasibility spike)
+
+Parts of this project are adapted from Kototoro
+(https://github.com/kototoro-app/Kototoro), licensed under the Apache License 2.0:
+
+- app/src/main/kotlin/com/oksen/spiderhost/DexInspector.kt
+  (protected-Init detection, from TVBoxProtectedInitDetector.kt; restructured)
+- app/src/main/kotlin/com/oksen/spiderhost/SpiderRunner.kt
+  (protected/standard Init strategy and Context seeding, from TVBoxJarSpiderRuntime.kt
+   and TVBoxProtectedInitCompat.kt; rewritten)
+- app/src/main/kotlin/com/oksen/spiderhost/TvboxConfig.kt (jar spec parsing)
+- app/src/main/kotlin/com/oksen/spiderhost/LocalServer.kt (/proxy routing)
+- app/src/main/java/com/github/catvod/** and app/src/main/java/com/whl/quickjs/**
+  (host-side class shapes and obfuscated stub method names the jars link against)
+
+Each adapted file carries a header noting its origin and changes.
+A copy of the Apache License 2.0 is in LICENSES/Apache-2.0.txt

@@ -1,0 +1,32 @@
+# Build output
+build/
+.gradle/
+.kotlin/
+*.apk
+*.aab
+*.ap_
+*.dex
+captures/
+.cxx/
+.externalNativeBuild/
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+
+# Local machine config — never commit
+local.properties
+*.keystore
+*.jks
+
+# Third-party spider jars / binaries / configs — never commit
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.bin
+*.so
+config*.json
+*.config.json
+configs/
+spider-cache/
+*.log
