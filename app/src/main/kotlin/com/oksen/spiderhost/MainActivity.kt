@@ -38,6 +38,29 @@ class MainActivity : Activity() {
         val preload = CheckBox(this).apply { text = "预先 System.load 解出的 .so（实验）"; isChecked = prefs.getBoolean("preload", false) }
         val forceStd = CheckBox(this).apply { text = "强制标准 Init.init（可能被杀进程）"; isChecked = prefs.getBoolean("forceStd", false) }
 
+        val pick = Button(this).apply { text = "从配置选择站点" }
+        pick.setOnClickListener {
+            val url = configUrl.text.toString().trim()
+            if (url.isBlank()) return@setOnClickListener
+            pick.isEnabled = false
+            Thread {
+                val result = runCatching {
+                    val req = okhttp3.Request.Builder().url(url).header("User-Agent", "okhttp/3.15").build()
+                    val body = okhttp3.OkHttpClient().newCall(req).execute().use { it.body!!.string() }
+                    TvboxConfig.sites(TvboxConfig.parse(TvboxConfig.decodeBody(body)))
+                }
+                main.post {
+                    pick.isEnabled = true
+                    result.onFailure { append("\n加载站点失败: ${it.message}\n") }
+                    result.onSuccess { sites ->
+                        val labels = sites.map { "${it.name}  [${it.key}]  t=${it.type} ${it.api}" }.toTypedArray()
+                        android.app.AlertDialog.Builder(this).setTitle("${sites.size} 个站点")
+                            .setItems(labels) { _, i -> siteKey.setText(sites[i].key) }
+                            .show()
+                    }
+                }
+            }.start()
+        }
         val run = Button(this).apply { text = "Run" }
         val share = Button(this).apply { text = "分享日志" }
         val clear = Button(this).apply { text = "清空日志" }
@@ -53,7 +76,7 @@ class MainActivity : Activity() {
         }
         scroll = ScrollView(this).apply { addView(output) }
 
-        listOf(configUrl, siteKey, keyword, timeout, fakePkg, preload, forceStd, buttons)
+        listOf(configUrl, pick, siteKey, keyword, timeout, fakePkg, preload, forceStd, buttons)
             .forEach { root.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)

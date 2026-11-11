@@ -36,6 +36,7 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         val fakeTvboxPackage: Boolean = false,
         val preloadSo: Boolean = false,
         val forceStandardInit: Boolean = false,
+        val maxFlags: Int = 3,
     )
 
     private val http = OkHttpClient.Builder()
@@ -63,7 +64,7 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         }
     }
 
-    private fun step(name: String) {
+    fun step(name: String) {
         DiagLog.w(">>> $name")
         runCatching { marker.writeText("$name @ ${java.util.Date()}") }
     }
@@ -153,6 +154,8 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         step("11 searchContent(${opts.keyword}, false)")
         val search = call("searchContent", loader) { spider.searchContent(opts.keyword, false) }
         DiagLog.w("searchContent length=${search?.length}\n${search?.take(4000)}")
+
+        PlayProbe(spider, loader, opts.maxFlags, { step(it) }, { l, c, b -> call(l, c, b) }).run(search, home)
     }
 
     /** Init strategy adapted from Kototoro TVBoxJarSpiderRuntime.initializeJar (Apache-2.0). */
@@ -200,7 +203,7 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         DiagLog.w("Context 写入字段 ${instance.javaClass.name}.${field.name}")
     }
 
-    private fun <T> call(label: String, loader: ClassLoader, block: () -> T): T? {
+    fun <T> call(label: String, loader: ClassLoader, block: () -> T): T? {
         val started = System.currentTimeMillis()
         val future = executor.submit<T> {
             val thread = Thread.currentThread()
