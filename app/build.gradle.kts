@@ -11,8 +11,8 @@ android {
         applicationId = "com.oksen.spiderhost"
         minSdk = 24
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.0.8-hub"
+        versionCode = 9
+        versionName = "0.0.9-hub"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }

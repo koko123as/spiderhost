@@ -199,9 +199,13 @@ object SpiderHub {
             if (found != null) break
         }
         DiagLog.w("LOGIN: 配置中心 ${cc.key} 给出的地址 $found")
-        val port = found?.let { runCatching { java.net.URI(it).port }.getOrNull() }?.takeIf { it > 0 } ?: 19988
-        val path = found?.let { runCatching { java.net.URI(it).rawPath }.getOrNull() }?.ifBlank { null } ?: "/config"
+        // The page may be served through our own /proxy (do=pan&action=config): route it to this jar.
+        activateForProxy(cc.key)
+        val uri = found?.let { runCatching { java.net.URI(it) }.getOrNull() }
+        val port = uri?.port?.takeIf { it > 0 } ?: 19988
+        val path = (uri?.rawPath?.ifBlank { null } ?: "/config") + (uri?.rawQuery?.let { "?$it" } ?: "")
         val local = "http://127.0.0.1:$port$path"
+        if (port == LocalServer.PORT) { DiagLog.w("LOGIN: 使用本机 $local"); return local }
         val ok = runCatching {
             okhttp3.OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS).readTimeout(5, TimeUnit.SECONDS).build()
                 .newCall(okhttp3.Request.Builder().url(local).build()).execute().use { it.code in 200..399 }
