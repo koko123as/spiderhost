@@ -17,14 +17,18 @@ class LocalServer : NanoHTTPD("127.0.0.1", PORT) {
 
     override fun serve(session: IHTTPSession): Response = try {
         when (session.uri.trimEnd('/')) {
-            "/health", "" -> json(JSONObject()
+            "/health" -> json(JSONObject()
                 .put("ok", true)
                 .put("port", PORT)
                 .put("siteKey", SpiderSession.siteKey ?: JSONObject.NULL)
                 .put("spiderLoaded", SpiderSession.spider != null)
-                .put("staticProxy", SpiderSession.staticProxy != null))
+                .put("staticProxy", SpiderSession.staticProxy != null)
+                .put("jellyfinSite", JfBackend.siteKey)
+                .put("jellyfinReady", JfBackend.spider != null)
+                .put("classes", JfBackend.classes.size))
             "/proxy" -> proxy(session)
-            else -> newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "not found")
+            // Everything else is the Jellyfin-compatible API (stage 2); it logs every request itself.
+            else -> JellyfinApi.handle(session, session.uri)
         }
     } catch (t: Throwable) {
         DiagLog.e("LocalServer ${session.uri} failed", t)

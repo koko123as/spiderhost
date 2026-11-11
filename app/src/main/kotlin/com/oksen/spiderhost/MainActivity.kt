@@ -1,6 +1,9 @@
 package com.oksen.spiderhost
 
+import android.Manifest
 import android.app.Activity
+import android.content.pm.PackageManager
+import android.os.Build
 import android.content.Intent
 import android.graphics.Typeface
 import android.os.Bundle
@@ -63,6 +66,7 @@ class MainActivity : Activity() {
             }.start()
         }
         val run = Button(this).apply { text = "Run" }
+        val serve = Button(this).apply { text = "启动 Jellyfin 服务（当前站点）" }
         val share = Button(this).apply { text = "分享日志" }
         val clear = Button(this).apply { text = "清空日志" }
         val buttons = LinearLayout(this).apply {
@@ -77,7 +81,7 @@ class MainActivity : Activity() {
         }
         scroll = ScrollView(this).apply { addView(output) }
 
-        listOf(configUrl, pick, siteKey, keyword, timeout, fakePkg, preload, forceStd, batch, buttons)
+        listOf(configUrl, pick, siteKey, keyword, timeout, fakePkg, preload, forceStd, batch, buttons, serve)
             .forEach { root.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
@@ -86,8 +90,8 @@ class MainActivity : Activity() {
         SpiderHostApp.instance.previousRunReport?.let { append("\n!!! $it\n") }
         DiagLog.listener = { line -> main.post { append(line) } }
 
-        run.setOnClickListener {
-            if (running) return@setOnClickListener
+        fun start(serveMode: Boolean) {
+            if (running) return
             prefs.edit()
                 .putString("configUrl", configUrl.text.toString().trim())
                 .putString("siteKey", siteKey.text.toString().trim())
@@ -106,19 +110,29 @@ class MainActivity : Activity() {
                 fakeTvboxPackage = fakePkg.isChecked,
                 preloadSo = preload.isChecked,
                 forceStandardInit = forceStd.isChecked,
-                batch = batch.isChecked,
+                batch = batch.isChecked && !serveMode,
+                serve = serveMode,
             )
+            if (serveMode) {
+                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                }
+                runCatching { ServeService.start(this) }.onFailure { DiagLog.e("启动前台服务失败", it) }
+            }
             running = true
             run.isEnabled = false
+            serve.isEnabled = false
             Thread({
                 try {
                     SpiderRunner(SpiderHostApp.instance, opts).run()
                 } finally {
                     running = false
-                    main.post { run.isEnabled = true }
+                    main.post { run.isEnabled = true; serve.isEnabled = true }
                 }
-            }, "spider-run").start()
+            }, if (serveMode) "spider-serve" else "spider-run").start()
         }
+        run.setOnClickListener { start(false) }
+        serve.setOnClickListener { start(true) }
         share.setOnClickListener {
             val text = DiagLog.readAll().takeLast(200_000)
             startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {

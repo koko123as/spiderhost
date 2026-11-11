@@ -38,6 +38,8 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         val forceStandardInit: Boolean = false,
         val maxFlags: Int = 3,
         val batch: Boolean = false,
+        /** Stage 2: load the site, then keep it served over the Jellyfin API instead of probing. */
+        val serve: Boolean = false,
     )
 
     private val http = OkHttpClient.Builder()
@@ -46,7 +48,7 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         .build()
 
     // One dedicated thread per run: if a spider call hangs we abandon it and the next run gets a fresh one.
-    private var executor: ExecutorService = newExecutor()
+    @Volatile private var executor: ExecutorService = newExecutor()
 
     private fun newExecutor(): ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "spider-call").apply { isDaemon = true }
@@ -63,7 +65,8 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
             DiagLog.e("========== RUN FAILED: ${classify(t)}", t)
         } finally {
             marker.delete()
-            executor.shutdown()
+            // In serve mode the executor keeps running spider calls for the HTTP server.
+            if (JfBackend.runner !== this) executor.shutdown()
         }
     }
 
@@ -156,6 +159,25 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         val home = call("homeContent(true)", loader) { spider.homeContent(true) }
         DiagLog.w("homeContent length=${home?.length}\n${home?.take(4000)}")
 
+        if (opts.serve) {
+            val classes = runCatching {
+                com.google.gson.JsonParser.parseString(home).asJsonObject.getAsJsonArray("class").map {
+                    val o = it.asJsonObject
+                    o.get("type_id").asString to o.get("type_name").asString
+                }
+            }.getOrDefault(emptyList())
+            JfBackend.runner?.takeIf { it !== this }?.shutdownExecutor()
+            JfBackend.loader = loader
+            JfBackend.spider = spider
+            JfBackend.siteKey = site.key
+            JfBackend.siteName = site.name
+            JfBackend.classes = classes
+            JfBackend.runner = this
+            DiagLog.w("SERVE: Jellyfin 接口已就绪 site=${site.key} (${site.name}) 分类 ${classes.size} 个: ${classes.joinToString { it.second }}")
+            DiagLog.w("SERVE: SenPlayer 添加 Jellyfin 服务器 地址 127.0.0.1 端口 ${LocalServer.PORT}，用户名任意，密码留空")
+            return
+        }
+
         step("11 searchContent(${opts.keyword}, false)")
         val search = call("searchContent", loader) { spider.searchContent(opts.keyword, false) }
         DiagLog.w("searchContent length=${search?.length}\n${search?.take(4000)}")
@@ -235,6 +257,8 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         field.set(instance, ctx)
         DiagLog.w("Context 写入字段 ${instance.javaClass.name}.${field.name}")
     }
+
+    fun shutdownExecutor() { executor.shutdownNow() }
 
     fun <T> call(label: String, loader: ClassLoader, block: () -> T): T? {
         val started = System.currentTimeMillis()

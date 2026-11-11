@@ -91,3 +91,12 @@ gradle assembleDebug                  # 需要 JDK 17 和 Android SDK (platform 
 ## 许可与致谢
 
 部分代码改编自 [Kototoro](https://github.com/kototoro-app/Kototoro)（Apache-2.0），详见 `NOTICE` 及各文件头注释。
+
+## 阶段 2：最小 Jellyfin 接口（0.0.3-jf）
+
+- 主界面「启动 Jellyfin 服务（当前站点）」：加载站点 key 指定的站，然后由 127.0.0.1:9978 提供 Jellyfin 兼容接口，并启动前台服务防止后台被杀。
+- SenPlayer：添加 Jellyfin 服务器，地址 `127.0.0.1`，端口 `9978`，用户名任意，密码留空。
+- 映射：分类 → 媒体库（tvshows），影片 → Series，线路 → Season，集 → Episode；播放时调用 playerContent，无请求头的直链 302 跳转，有请求头的单文件经本机透传。
+- 每个请求都以 `[JF]` 记录；未实现的接口记为 `JF UNHANDLED` 并返回 404，下一轮按真实请求补齐。
+- 字段名来自 Jellyfin 公开 OpenAPI；SenPlayer 实际调用哪些接口以日志为准。
+- 已知限制：需请求头的 HLS 分片暂不带头；分页按 CatVod 页近似；全部影片按剧集处理。

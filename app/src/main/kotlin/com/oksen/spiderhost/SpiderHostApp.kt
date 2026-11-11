@@ -26,6 +26,7 @@ class SpiderHostApp : Application() {
         previousRunReport = buildPreviousRunReport()
         Init.set(this)
         Proxy.set(LocalServer.PORT)
+        JellyfinApi.init(filesDir)
         server = LocalServer()
         runCatching { server.start() }
             .onSuccess { DiagLog.w("LocalServer listening on 127.0.0.1:${LocalServer.PORT}") }
@@ -36,7 +37,11 @@ class SpiderHostApp : Application() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
             runCatching { DiagLog.e("UNCAUGHT on thread ${thread.name}", error) }
-            previous?.uncaughtException(thread, error)
+            // Flyme's screen-recognition picker (com.meizu.internal.picker) crashes inside our process on its own
+            // "ContentCapture" thread; that is not our code, so log it and keep the process (and the server) alive.
+            val systemOnly = error.stackTrace.any { it.className.startsWith("com.meizu.internal.") }
+            if (systemOnly) DiagLog.w("忽略系统线程异常（Flyme 识屏），进程继续运行")
+            else previous?.uncaughtException(thread, error)
         }
     }
 
