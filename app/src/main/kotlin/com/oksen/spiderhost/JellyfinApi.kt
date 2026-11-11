@@ -489,7 +489,8 @@ object JellyfinApi {
         return arr
     }
 
-    private fun imageTags(pic: String) = JSONObject().apply { if (pic.isNotBlank()) put("Primary", md5(pic).take(16)) }
+    /** Always advertise a Primary image: an empty list pic is filled from the detail when the image is asked for. */
+    private fun imageTags(pic: String) = JSONObject().put("Primary", md5(pic.ifBlank { "nopic" }).take(16))
 
     private fun queryResult(items: JSONArray, start: Int, total: Int = start + items.length()) = JSONObject()
         .put("Items", items)
@@ -611,17 +612,63 @@ object JellyfinApi {
         return HlsRelay.fetch(s, url, r.headers, "[JF] stream $itemId q$qi")
     }
 
+    /**
+     * Covers: search lists often leave vod_pic empty, use //host/... or append TVBox-style
+     * "@Referer=...@User-Agent=..." headers, or sit behind hotlink protection. So: an empty pic is
+     * taken from the detail, and the picture is fetched here with those headers instead of a bare 302.
+     */
     private fun image(id: String): Response {
         val key = lookup(id) ?: return text(Response.Status.NOT_FOUND, "unknown id")
         val kind = key.getOrNull(1)
-        if (kind == "group") {
-            val pic = membersOf(key).firstNotNullOfOrNull { (s, v) -> vods["$s|$v"]?.pic?.takeIf { it.startsWith("http") } }
-            return if (pic != null) redirect(pic) else text(Response.Status.NOT_FOUND, "no image")
+        val targets: List<Pair<String, String>> = when (kind) {
+            "group" -> membersOf(key)
+            "series", "season", "episode" -> listOf(key[0] to key[2])
+            else -> return text(Response.Status.NOT_FOUND, "no image")
         }
-        if (kind != "series" && kind != "season" && kind != "episode") return text(Response.Status.NOT_FOUND, "no image")
-        val k = key[0] + "|" + key[2]
-        val pic = (vods[k]?.pic ?: details[k]?.vod?.pic).orEmpty()
-        return if (pic.startsWith("http")) redirect(pic) else text(Response.Status.NOT_FOUND, "no image")
+        val pic = targets.firstNotNullOfOrNull { (s, v) -> picOf(s, v, false) }
+            ?: targets.firstNotNullOfOrNull { (s, v) -> picOf(s, v, true) }
+            ?: return text(Response.Status.NOT_FOUND, "no image")
+        return fetchImage(pic)
+    }
+
+    private fun picOf(site: String, vodId: String, loadDetail: Boolean): String? {
+        val k = "$site|$vodId"
+        val p = (vods[k]?.pic?.takeIf { it.isNotBlank() } ?: details[k]?.vod?.pic?.takeIf { it.isNotBlank() }
+            ?: if (loadDetail) detail(site, vodId)?.vod?.pic else null)?.trim()
+        return when {
+            p.isNullOrBlank() -> null
+            p.startsWith("//") -> "https:$p"
+            p.startsWith("http") -> p
+            else -> null
+        }
+    }
+
+    private fun fetchImage(raw: String): Response {
+        val parts = raw.split('@')
+        val url = parts[0]
+        val headers = LinkedHashMap<String, String>()
+        parts.drop(1).forEach { h -> if ('=' in h) headers[h.substringBefore('=').trim()] = h.substringAfter('=').trim() }
+        if (headers.keys.none { it.equals("User-Agent", true) })
+            headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+        if (headers.keys.none { it.equals("Referer", true) })
+            runCatching { java.net.URI(url) }.getOrNull()?.let { headers["Referer"] = "${it.scheme}://${it.host}/" }
+        return try {
+            val b = Request.Builder().url(url)
+            headers.forEach { (k, v) -> b.header(k, v) }
+            http.newCall(b.build()).execute().use { r ->
+                val bytes = r.body?.bytes()
+                if (!r.isSuccessful || bytes == null || bytes.isEmpty()) {
+                    DiagLog.w("[JF] 封面 ${r.code} ${url.take(160)}")
+                    return text(Response.Status.NOT_FOUND, "no image")
+                }
+                val type = r.header("Content-Type")?.takeIf { it.startsWith("image/") } ?: "image/jpeg"
+                NanoHTTPD.newFixedLengthResponse(Response.Status.OK, type, java.io.ByteArrayInputStream(bytes), bytes.size.toLong())
+                    .apply { addHeader("Cache-Control", "public, max-age=86400") }
+            }
+        } catch (t: Throwable) {
+            DiagLog.w("[JF] 封面失败 ${url.take(160)}: $t")
+            text(Response.Status.NOT_FOUND, "no image")
+        }
     }
 
     // ---------- spider calls ----------
