@@ -42,11 +42,15 @@ class MainActivity : Activity() {
         val batch = CheckBox(this).apply { text = "批量：测同一 jar 的全部站点（忽略站点 key 以外的单站流程）"; isChecked = prefs.getBoolean("batch", false) }
         val forceStd = CheckBox(this).apply { text = "强制标准 Init.init（可能被杀进程）"; isChecked = prefs.getBoolean("forceStd", false) }
 
-        val pick = Button(this).apply { text = "从配置选择站点" }
-        pick.setOnClickListener {
+        val pick = Button(this).apply { text = "选择首页站点（服务中可直接切换）" }
+        val pickEnabled = Button(this).apply { text = "选择启用站点（搜索 / 全部站点）" }
+        val probe = Button(this).apply { text = "探查配置中心（网盘登录）" }
+
+        fun loadSites(btn: Button, onOk: (List<TvboxConfig.Site>) -> Unit) {
             val url = configUrl.text.toString().trim()
-            if (url.isBlank()) return@setOnClickListener
-            pick.isEnabled = false
+            if (url.isBlank()) return
+            if (SpiderHub.ready && SpiderHub.configUrl == url) { onOk(SpiderHub.sites); return }
+            btn.isEnabled = false
             Thread {
                 val result = runCatching {
                     val req = okhttp3.Request.Builder().url(url).header("User-Agent", "okhttp/3.15").build()
@@ -54,19 +58,62 @@ class MainActivity : Activity() {
                     TvboxConfig.sites(TvboxConfig.parse(TvboxConfig.decodeBody(body)))
                 }
                 main.post {
-                    pick.isEnabled = true
+                    btn.isEnabled = true
                     result.onFailure { append("\n加载站点失败: ${it.message}\n") }
-                    result.onSuccess { sites ->
-                        val labels = sites.map { "${it.name}  [${it.key}]  t=${it.type} ${it.api}" }.toTypedArray()
-                        android.app.AlertDialog.Builder(this).setTitle("${sites.size} 个站点")
-                            .setItems(labels) { _, i -> siteKey.setText(sites[i].key) }
-                            .show()
-                    }
+                    result.onSuccess(onOk)
                 }
             }.start()
         }
+
+        pick.setOnClickListener {
+            loadSites(pick) { sites ->
+                val labels = sites.map { "${it.name}  [${it.key}]  t=${it.type} ${it.api}" }.toTypedArray()
+                android.app.AlertDialog.Builder(this).setTitle("${sites.size} 个站点")
+                    .setItems(labels) { _, i ->
+                        siteKey.setText(sites[i].key)
+                        prefs.edit().putString("siteKey", sites[i].key).apply()
+                        if (SpiderHub.ready) SpiderHub.setHome(sites[i].key)
+                    }
+                    .show()
+            }
+        }
+        pickEnabled.setOnClickListener {
+            loadSites(pickEnabled) { all ->
+                val sites = all.filter { SpiderHub.isSupported(it) }
+                val saved = prefs.getStringSet("enabledSites", emptySet())!!
+                val checked = BooleanArray(sites.size) { saved.isEmpty() || sites[it].key in saved }
+                android.app.AlertDialog.Builder(this).setTitle("启用的站点（${sites.size} 个 type-3）")
+                    .setMultiChoiceItems(sites.map { "${it.name}  [${it.key}]" }.toTypedArray(), checked) { _, i, on -> checked[i] = on }
+                    .setPositiveButton("保存") { _, _ ->
+                        val set = sites.filterIndexed { i, _ -> checked[i] }.map { it.key }.toSet()
+                        val store = if (set.size == sites.size) emptySet() else set
+                        prefs.edit().putStringSet("enabledSites", store).apply()
+                        SpiderHub.enabled = store
+                        append("\n启用站点: ${if (store.isEmpty()) "全部 ${sites.size}" else set.size.toString()} 个\n")
+                    }
+                    .setNeutralButton("全选") { _, _ ->
+                        prefs.edit().putStringSet("enabledSites", emptySet()).apply()
+                        SpiderHub.enabled = emptySet()
+                        append("\n启用站点: 全部 ${sites.size} 个\n")
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+        }
+        probe.setOnClickListener {
+            if (!SpiderHub.ready) { append("\n先启动 Jellyfin 服务，再探查配置中心\n"); return@setOnClickListener }
+            loadSites(probe) { sites ->
+                val cands = sites.filter { SpiderHub.isSupported(it) && (it.name.contains("配置") || it.key.contains("config", true) || it.name.contains("盘", true)) }
+                    .ifEmpty { sites.filter { SpiderHub.isSupported(it) } }
+                android.app.AlertDialog.Builder(this).setTitle("选择要探查的站点")
+                    .setItems(cands.map { "${it.name}  [${it.key}]" }.toTypedArray()) { _, i ->
+                        Thread({ SpiderHub.probeConfigCentre(cands[i].key) }, "probe").start()
+                    }
+                    .show()
+            }
+        }
         val run = Button(this).apply { text = "Run" }
-        val serve = Button(this).apply { text = "启动 Jellyfin 服务（当前站点）" }
+        val serve = Button(this).apply { text = "启动 Jellyfin 服务（全部站点，首页=当前站点）" }
         val share = Button(this).apply { text = "分享日志" }
         val clear = Button(this).apply { text = "清空日志" }
         val buttons = LinearLayout(this).apply {
@@ -81,8 +128,11 @@ class MainActivity : Activity() {
         }
         scroll = ScrollView(this).apply { addView(output) }
 
-        listOf(configUrl, pick, siteKey, keyword, timeout, fakePkg, preload, forceStd, batch, buttons, serve)
-            .forEach { root.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
+        // Controls scroll on their own so the log keeps half the screen on a phone.
+        val controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        listOf(configUrl, pick, siteKey, pickEnabled, serve, probe, buttons, keyword, timeout, fakePkg, preload, forceStd, batch)
+            .forEach { controls.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
+        root.addView(ScrollView(this).apply { addView(controls) }, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
 

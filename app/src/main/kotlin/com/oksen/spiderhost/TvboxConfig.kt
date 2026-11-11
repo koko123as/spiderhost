@@ -11,7 +11,7 @@ import java.io.StringReader
 /** Just enough TVBox config handling for the spike. */
 object TvboxConfig {
 
-    data class Site(val key: String, val name: String, val type: Int, val api: String, val ext: String, val jarRaw: String?)
+    data class Site(val key: String, val name: String, val type: Int, val api: String, val ext: String, val jarRaw: String?, val searchable: Boolean = true)
     data class JarSpec(val raw: String, val url: String, val md5: String?)
 
     /**
@@ -49,6 +49,8 @@ object TvboxConfig {
             api = o.str("api"),
             ext = o.get("ext")?.let { extToString(it) }.orEmpty(),
             jarRaw = o.str("jar").ifBlank { null },
+            // TVBox convention: searchable 0 means "skip in global search"; missing means searchable.
+            searchable = o.get("searchable")?.let { runCatching { it.asInt }.getOrNull() } != 0,
         )
     }.orEmpty()
 

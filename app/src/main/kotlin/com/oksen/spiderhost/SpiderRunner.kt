@@ -20,6 +20,8 @@ import java.util.concurrent.TimeoutException
 
 /** The spider currently loaded, shared with LocalServer for /proxy. */
 object SpiderSession {
+    /** staticProxy per jar loader, so /proxy can route to the jar of the spider last used for playback. */
+    val staticProxies = java.util.concurrent.ConcurrentHashMap<ClassLoader, Method?>()
     @Volatile var classLoader: ClassLoader? = null
     @Volatile var spider: Spider? = null
     @Volatile var staticProxy: Method? = null
@@ -66,7 +68,7 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         } finally {
             marker.delete()
             // In serve mode the executor keeps running spider calls for the HTTP server.
-            if (JfBackend.runner !== this) executor.shutdown()
+            if (SpiderHub.runner !== this) executor.shutdown()
         }
     }
 
@@ -88,8 +90,50 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         require(site.type == 3) { "site.type=${site.type}，本 spike 只测 type 3" }
         require(site.api.startsWith("csp_")) { "api=${site.api} 不是 csp_ 形式" }
 
+        if (opts.serve) {
+            SpiderHub.start(this, app, opts.configUrl, root, sites, opts.siteKey)
+            return
+        }
+
         step("2 resolve spider url")
         val rawJar = site.jarRaw ?: root.get("spider")?.asString ?: error("site 和根都没有 spider/jar 字段")
+        val (loader, ctx) = prepareJar(rawJar)
+
+        if (opts.batch) { runBatch(sites, site, rawJar, loader, ctx); return }
+
+        step("8 instantiate ${site.api}")
+        val className = "com.github.catvod.spider." + site.api.removePrefix("csp_")
+        val spider = call("newInstance $className", loader) {
+            loader.loadClass(className).getDeclaredConstructor().newInstance() as Spider
+        } ?: error("实例化 $className 失败，见上方堆栈")
+        spider.siteKey = site.key
+        SpiderSession.spider = spider
+        SpiderSession.siteKey = site.key
+
+        step("9 spider.init")
+        val ext = TvboxConfig.resolveExt(site.ext, opts.configUrl)
+        call("init(ctx, ext)", loader) {
+            try {
+                spider.init(ctx, ext)
+            } catch (e: AbstractMethodError) {
+                spider.init(ctx)
+            }
+        }
+
+        step("10 homeContent(true)")
+        val home = call("homeContent(true)", loader) { spider.homeContent(true) }
+        DiagLog.w("homeContent length=${home?.length}\n${home?.take(4000)}")
+
+        step("11 searchContent(${opts.keyword}, false)")
+        val search = call("searchContent", loader) { spider.searchContent(opts.keyword, false) }
+        DiagLog.w("searchContent length=${search?.length}\n${search?.take(4000)}")
+
+        PlayProbe(spider, loader, opts.maxFlags, { step(it) }, { l, c, b -> call(l, c, b) }).run(search, home)
+    }
+
+
+    /** Steps 2-7 for one jar: download, inspect, native .so, DexClassLoader, Init. Shared by single-site and hub modes. */
+    fun prepareJar(rawJar: String): Pair<ClassLoader, Context> {
         val spec = TvboxConfig.jarSpec(rawJar, opts.configUrl)
         DiagLog.w("jar url=${spec.url} md5=${spec.md5}")
 
@@ -130,59 +174,12 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         DiagLog.w("spider.Proxy.proxy(Map) present=${staticProxy != null}")
         SpiderSession.classLoader = loader
         SpiderSession.staticProxy = staticProxy
+        if (staticProxy != null) SpiderSession.staticProxies[loader] = staticProxy
 
         step("7 Init")
         call("Init", loader) { initJar(loader, ctx, isProtected) }
 
-        if (opts.batch) { runBatch(sites, site, rawJar, loader, ctx); return }
-
-        step("8 instantiate ${site.api}")
-        val className = "com.github.catvod.spider." + site.api.removePrefix("csp_")
-        val spider = call("newInstance $className", loader) {
-            loader.loadClass(className).getDeclaredConstructor().newInstance() as Spider
-        } ?: error("实例化 $className 失败，见上方堆栈")
-        spider.siteKey = site.key
-        SpiderSession.spider = spider
-        SpiderSession.siteKey = site.key
-
-        step("9 spider.init")
-        val ext = TvboxConfig.resolveExt(site.ext, opts.configUrl)
-        call("init(ctx, ext)", loader) {
-            try {
-                spider.init(ctx, ext)
-            } catch (e: AbstractMethodError) {
-                spider.init(ctx)
-            }
-        }
-
-        step("10 homeContent(true)")
-        val home = call("homeContent(true)", loader) { spider.homeContent(true) }
-        DiagLog.w("homeContent length=${home?.length}\n${home?.take(4000)}")
-
-        if (opts.serve) {
-            val classes = runCatching {
-                com.google.gson.JsonParser.parseString(home).asJsonObject.getAsJsonArray("class").map {
-                    val o = it.asJsonObject
-                    o.get("type_id").asString to o.get("type_name").asString
-                }
-            }.getOrDefault(emptyList())
-            JfBackend.runner?.takeIf { it !== this }?.shutdownExecutor()
-            JfBackend.loader = loader
-            JfBackend.spider = spider
-            JfBackend.siteKey = site.key
-            JfBackend.siteName = site.name
-            JfBackend.classes = classes
-            JfBackend.runner = this
-            DiagLog.w("SERVE: Jellyfin 接口已就绪 site=${site.key} (${site.name}) 分类 ${classes.size} 个: ${classes.joinToString { it.second }}")
-            DiagLog.w("SERVE: SenPlayer 添加 Jellyfin 服务器 地址 127.0.0.1 端口 ${LocalServer.PORT}，用户名任意，密码留空")
-            return
-        }
-
-        step("11 searchContent(${opts.keyword}, false)")
-        val search = call("searchContent", loader) { spider.searchContent(opts.keyword, false) }
-        DiagLog.w("searchContent length=${search?.length}\n${search?.take(4000)}")
-
-        PlayProbe(spider, loader, opts.maxFlags, { step(it) }, { l, c, b -> call(l, c, b) }).run(search, home)
+        return loader to ctx
     }
 
     /** Stage 1b: every type-3 site that uses the same jar -> init, search, detail, player, probe. One summary line per site. */

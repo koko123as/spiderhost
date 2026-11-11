@@ -100,3 +100,14 @@ gradle assembleDebug                  # 需要 JDK 17 和 Android SDK (platform 
 - 每个请求都以 `[JF]` 记录；未实现的接口记为 `JF UNHANDLED` 并返回 404，下一轮按真实请求补齐。
 - 字段名来自 Jellyfin 公开 OpenAPI；SenPlayer 实际调用哪些接口以日志为准。
 - 已知限制：需请求头的 HLS 分片暂不带头；分页按 CatVod 页近似；全部影片按剧集处理。
+
+## 阶段 3：多站点（0.0.4-hub）
+
+- `SpiderHub.kt`：配置里所有 type-3 `csp_` 站点一起服务，按需加载（首次用到才实例化并 `init`），每个 jar 只下载、Init 一次。
+- SenPlayer 媒体库 = 首页站点的分类（相当于影视仓「首页数据源」，在 App 里「选择首页站点」可随时切换，SenPlayer 刷新即可）+ 一个「全部站点」库：站点 → 分类 → 影片。
+- 搜索：所有「启用」且 `searchable != 0` 的站点并发搜索，总时限 15 秒，结果名后缀「· 站点名」。
+- 多画质 url 数组（`["1080P","url",...]`）拆成多个 MediaSource，播放器里可切换。
+- `HlsRelay.kt`：需要请求头的地址经 127.0.0.1 转发；HLS 会改写 m3u8，分片、子列表、密钥都经 `/hls` 带头请求。
+- 播放地址指向 `127.0.0.1:9978/proxy` 时（网盘类站点常见），`/proxy` 会切到该站点所在 jar 的 spider。
+- 「探查配置中心」：把配置中心站点的 home/category/detail 原始输出写进日志，用来确认网盘登录方式（二维码、Cookie 表单或本地网页），不做假设。
+- 未验证：SenPlayer 对「全部站点」里 Folder 类型的浏览支持；网盘 4K 播放（需要先完成夸克登录）。

@@ -37,7 +37,7 @@ class ServeService : Service() {
         val n = builder
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentTitle("SpiderHost 运行中")
-            .setContentText("Jellyfin 接口 127.0.0.1:${LocalServer.PORT}  站点: ${JfBackend.siteName.ifBlank { "加载中" }}")
+            .setContentText("Jellyfin 接口 127.0.0.1:${LocalServer.PORT}  首页站点: ${SpiderHub.shortName(SpiderHub.homeKey).ifBlank { "加载中" }}")
             .setContentIntent(open)
             .setOngoing(true)
             .build()

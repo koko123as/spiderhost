@@ -1,6 +1,5 @@
 package com.oksen.spiderhost
 
-import com.github.catvod.crawler.Spider
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import fi.iki.elonen.NanoHTTPD
@@ -14,27 +13,6 @@ import java.io.File
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
-
-/**
- * The single spider currently served over the Jellyfin-compatible API.
- * Filled by SpiderRunner when started in serve mode.
- */
-object JfBackend {
-    @Volatile var runner: SpiderRunner? = null
-    @Volatile var spider: Spider? = null
-    @Volatile var loader: ClassLoader? = null
-    @Volatile var siteKey: String = ""
-    @Volatile var siteName: String = ""
-    /** homeContent "class": (type_id, type_name). */
-    @Volatile var classes: List<Pair<String, String>> = emptyList()
-
-    fun <T> call(label: String, block: (Spider) -> T): T? {
-        val r = runner ?: return null
-        val s = spider ?: return null
-        val l = loader ?: return null
-        return r.call(label, l) { block(s) }
-    }
-}
 
 /**
  * Minimal Jellyfin-compatible API on top of one CatVod spider (stage 2).
@@ -82,8 +60,8 @@ object JellyfinApi {
         }
     }
 
-    private fun idOf(vararg parts: String): String {
-        val key = listOf(JfBackend.siteKey) + parts.toList()
+    private fun idOf(site: String, vararg parts: String): String {
+        val key = listOf(site) + parts.toList()
         val id = md5(key.joinToString("\u0001"))
         if (ids.putIfAbsent(id, key) == null) {
             runCatching { idFile?.appendText(id + "\t" + key.joinToString("\t") { it.replace('\t', ' ').replace('\n', ' ') } + "\n") }
@@ -94,19 +72,22 @@ object JellyfinApi {
     /** [siteKey, kind, ...] */
     private fun lookup(id: String): List<String>? = ids[id.lowercase().replace("-", "")]
 
-    private fun viewId(tid: String) = idOf("view", tid)
-    private fun seriesId(vodId: String) = idOf("series", vodId)
-    private fun seasonId(vodId: String, f: Int) = idOf("season", vodId, f.toString())
-    private fun episodeId(vodId: String, f: Int, e: Int) = idOf("episode", vodId, f.toString(), e.toString())
+    private fun viewId(site: String, tid: String) = idOf(site, "view", tid)
+    private fun seriesId(site: String, vodId: String) = idOf(site, "series", vodId)
+    private fun seasonId(site: String, vodId: String, f: Int) = idOf(site, "season", vodId, f.toString())
+    private fun episodeId(site: String, vodId: String, f: Int, e: Int) = idOf(site, "episode", vodId, f.toString(), e.toString())
+    private val sitesRootId get() = idOf("_", "sites")
+    private fun siteFolderId(site: String) = idOf(site, "site")
+    private fun seriesId(v: Vod) = seriesId(v.site, v.id)
 
     // ---------- caches ----------
 
-    private data class Vod(val id: String, val name: String, val pic: String, val remarks: String, val year: String)
+    private data class Vod(val site: String, val id: String, val name: String, val pic: String, val remarks: String, val year: String)
     private data class Detail(
         val vod: Vod, val content: String, val actor: String, val director: String,
         val flags: List<String>, val episodes: List<List<Pair<String, String>>>,
     )
-    private data class Resolved(val url: String, val headers: Map<String, String>, val at: Long)
+    private data class Resolved(val qualities: List<Pair<String, String>>, val headers: Map<String, String>, val at: Long)
 
     private val vods = ConcurrentHashMap<String, Vod>()
     private val details = ConcurrentHashMap<String, Detail>()
@@ -263,31 +244,53 @@ object JellyfinApi {
 
     // ---------- library ----------
 
+    /** Libraries: the home site's categories (like 影视仓's 首页), then one 全部站点 library. */
     private fun views(): JSONObject {
         val arr = JSONArray()
-        JfBackend.classes.forEach { (tid, name) ->
-            arr.put(JSONObject()
-                .put("Name", name)
-                .put("ServerId", SERVER_ID)
-                .put("Id", viewId(tid))
-                .put("Type", "CollectionFolder")
-                .put("CollectionType", "tvshows")
-                .put("IsFolder", true)
-                .put("ImageTags", JSONObject())
-                .put("BackdropImageTags", JSONArray())
-                .put("LocationType", "FileSystem")
-                .put("UserData", userData(false)))
-        }
+        val home = SpiderHub.homeKey
+        SpiderHub.classesOf(home).forEach { (tid, name) -> arr.put(folderDto(viewId(home, tid), name, "CollectionFolder", "tvshows")) }
+        arr.put(folderDto(sitesRootId, "全部站点（${SpiderHub.served().size}）", "CollectionFolder", "folders"))
         return queryResult(arr, 0)
+    }
+
+    private fun folderDto(id: String, name: String, type: String, collectionType: String?, parentId: String? = null) = JSONObject()
+        .put("Name", name)
+        .put("ServerId", SERVER_ID)
+        .put("Id", id)
+        .put("Type", type)
+        .apply { if (collectionType != null) put("CollectionType", collectionType) }
+        .apply { if (parentId != null) put("ParentId", parentId) }
+        .put("IsFolder", true)
+        .put("ImageTags", JSONObject())
+        .put("BackdropImageTags", JSONArray())
+        .put("LocationType", "FileSystem")
+        .put("UserData", userData(false))
+
+    private fun siteFolders(): JSONArray {
+        val arr = JSONArray()
+        SpiderHub.served().forEach { s ->
+            val mark = if (s.key == SpiderHub.homeKey) "★ " else ""
+            arr.put(folderDto(siteFolderId(s.key), mark + SpiderHub.shortName(s.key), "Folder", null, sitesRootId))
+        }
+        return arr
+    }
+
+    private fun classFolders(site: String): JSONArray {
+        val arr = JSONArray()
+        SpiderHub.classesOf(site).forEach { (tid, name) -> arr.put(folderDto(viewId(site, tid), name, "Folder", null, siteFolderId(site))) }
+        return arr
     }
 
     private fun latest(q: Map<String, String>): JSONArray {
         val parent = q["parentid"]?.let { lookup(it) }
-        val tid = if (parent?.getOrNull(1) == "view") parent[2] else JfBackend.classes.firstOrNull()?.first ?: return JSONArray()
+        val (site, tid) = when (parent?.getOrNull(1)) {
+            "view" -> parent[0] to parent[2]
+            "sites", "site" -> return JSONArray()
+            else -> SpiderHub.homeKey to (SpiderHub.classesOf(SpiderHub.homeKey).firstOrNull()?.first ?: return JSONArray())
+        }
         val limit = q["limit"]?.toIntOrNull() ?: 16
-        val list = category(tid, 1).first
         val arr = JSONArray()
-        list.take(limit).forEach { arr.put(seriesDto(it, null)) }
+        category(site, tid, 1).first.take(limit).forEach { arr.put(seriesDto(it, null)) }
         return arr
     }
 
@@ -295,9 +298,12 @@ object JellyfinApi {
         val start = q["startindex"]?.toIntOrNull() ?: 0
         val term = q["searchterm"].orEmpty()
         if (term.isNotBlank()) {
+            val types = q["includeitemtypes"].orEmpty().lowercase()
+            // Everything we return is a Series; a search for only People/Episodes/etc gets nothing instead of duplicates.
+            if (types.isNotBlank() && "series" !in types) return queryResult(JSONArray(), 0)
             val arr = JSONArray()
             search(term).forEach { arr.put(seriesDto(it, null)) }
-            return queryResult(arr, start)
+            return queryResult(arr, 0)
         }
         q["ids"]?.takeIf { it.isNotBlank() }?.let { list ->
             val arr = JSONArray()
@@ -307,21 +313,20 @@ object JellyfinApi {
         val parentId = q["parentid"].orEmpty()
         val parent = lookup(parentId)
         return when (parent?.getOrNull(1)) {
+            "sites" -> siteFolders().let { queryResult(it, 0) }
+            "site" -> classFolders(parent[0]).let { queryResult(it, 0) }
             "view" -> {
                 val pageSize = q["limit"]?.toIntOrNull()?.takeIf { it > 0 }
-                val (list, total) = categoryWindow(parent[2], start, pageSize)
+                val (list, total) = categoryWindow(parent[0], parent[2], start, pageSize)
                 val arr = JSONArray()
                 list.forEach { arr.put(seriesDto(it, null)) }
                 queryResult(arr, start, total)
             }
             "series" -> seasons(parentId)
-            "season" -> episodes(seriesId(parent[2]), parentId)
+            "season" -> episodes(seriesId(parent[0], parent[2]), parentId)
             else -> {
-                DiagLog.w("[JF] /Items without ParentId/SearchTerm/Ids -> first class page 1 (params=${q.keys})")
-                val tid = JfBackend.classes.firstOrNull()?.first
-                val arr = JSONArray()
-                if (tid != null) category(tid, 1).first.forEach { arr.put(seriesDto(it, null)) }
-                queryResult(arr, 0)
+                DiagLog.w("[JF] /Items without known ParentId/SearchTerm/Ids -> empty (params=${q.keys})")
+                queryResult(JSONArray(), 0)
             }
         }
     }
@@ -334,19 +339,23 @@ object JellyfinApi {
     private fun dtoFor(id: String): JSONObject? {
         val key = lookup(id) ?: return null
         return when (key.getOrNull(1)) {
-            "view" -> views().getJSONArray("Items").let { arr ->
-                (0 until arr.length()).map { arr.getJSONObject(it) }.firstOrNull { it.getString("Id") == viewId(key[2]) }
+            "sites" -> folderDto(sitesRootId, "全部站点", "CollectionFolder", "folders")
+            "site" -> folderDto(siteFolderId(key[0]), SpiderHub.shortName(key[0]), "Folder", null, sitesRootId)
+            "view" -> {
+                val name = SpiderHub.classesOf(key[0]).firstOrNull { it.first == key[2] }?.second ?: key[2]
+                if (key[0] == SpiderHub.homeKey) folderDto(viewId(key[0], key[2]), name, "CollectionFolder", "tvshows")
+                else folderDto(viewId(key[0], key[2]), name, "Folder", null, siteFolderId(key[0]))
             }
-            "series" -> detail(key[2])?.let { seriesDto(it.vod, it) }
-            "season" -> detail(key[2])?.let { d -> seasonDto(d, key[3].toInt()) }
-            "episode" -> detail(key[2])?.let { d -> episodeDto(d, key[3].toInt(), key[4].toInt(), withSources = true) }
+            "series" -> detail(key[0], key[2])?.let { seriesDto(it.vod, it) }
+            "season" -> detail(key[0], key[2])?.let { d -> seasonDto(d, key[3].toInt()) }
+            "episode" -> detail(key[0], key[2])?.let { d -> episodeDto(d, key[3].toInt(), key[4].toInt(), withSources = true) }
             else -> null
         }
     }
 
     private fun seasons(seriesIdStr: String): JSONObject {
         val key = lookup(seriesIdStr) ?: return queryResult(JSONArray(), 0)
-        val d = detail(key[2]) ?: return queryResult(JSONArray(), 0)
+        val d = detail(key[0], key[2]) ?: return queryResult(JSONArray(), 0)
         val arr = JSONArray()
         d.flags.indices.forEach { arr.put(seasonDto(d, it)) }
         return queryResult(arr, 0)
@@ -354,7 +363,7 @@ object JellyfinApi {
 
     private fun episodes(seriesIdStr: String, seasonIdStr: String?): JSONObject {
         val key = lookup(seriesIdStr) ?: return queryResult(JSONArray(), 0)
-        val d = detail(key[2]) ?: return queryResult(JSONArray(), 0)
+        val d = detail(key[0], key[2]) ?: return queryResult(JSONArray(), 0)
         val season = seasonIdStr?.let { lookup(it) }?.takeIf { it.getOrNull(1) == "season" }?.get(3)?.toIntOrNull()
         val arr = JSONArray()
         val flagIdx = if (season != null) listOf(season) else d.flags.indices.toList()
@@ -366,7 +375,7 @@ object JellyfinApi {
         val term = q["searchterm"].orEmpty()
         val arr = JSONArray()
         if (term.isNotBlank()) search(term).forEach { v ->
-            val id = seriesId(v.id)
+            val id = seriesId(v)
             arr.put(JSONObject()
                 .put("ItemId", id)
                 .put("Id", id)
@@ -385,7 +394,7 @@ object JellyfinApi {
     private fun seriesDto(v: Vod, d: Detail?): JSONObject = JSONObject()
         .put("Name", v.name)
         .put("ServerId", SERVER_ID)
-        .put("Id", seriesId(v.id))
+        .put("Id", seriesId(v))
         .put("Type", "Series")
         .put("IsFolder", true)
         .put("MediaType", "Unknown")
@@ -403,13 +412,13 @@ object JellyfinApi {
     private fun seasonDto(d: Detail, f: Int): JSONObject = JSONObject()
         .put("Name", d.flags.getOrElse(f) { "线路${f + 1}" })
         .put("ServerId", SERVER_ID)
-        .put("Id", seasonId(d.vod.id, f))
+        .put("Id", seasonId(d.vod.site, d.vod.id, f))
         .put("Type", "Season")
         .put("IsFolder", true)
         .put("IndexNumber", f + 1)
-        .put("SeriesId", seriesId(d.vod.id))
+        .put("SeriesId", seriesId(d.vod))
         .put("SeriesName", d.vod.name)
-        .put("ParentId", seriesId(d.vod.id))
+        .put("ParentId", seriesId(d.vod))
         .put("ChildCount", d.episodes.getOrNull(f)?.size ?: 0)
         .put("LocationType", "Remote")
         .put("UserData", userData(false))
@@ -417,7 +426,7 @@ object JellyfinApi {
         .apply { if (d.vod.pic.isNotBlank()) put("SeriesPrimaryImageTag", md5(d.vod.pic).take(16)) }
 
     private fun episodeDto(d: Detail, f: Int, e: Int, withSources: Boolean): JSONObject {
-        val id = episodeId(d.vod.id, f, e)
+        val id = episodeId(d.vod.site, d.vod.id, f, e)
         return JSONObject()
             .put("Name", d.episodes.getOrNull(f)?.getOrNull(e)?.first ?: "第${e + 1}集")
             .put("ServerId", SERVER_ID)
@@ -429,15 +438,15 @@ object JellyfinApi {
             .put("LocationType", "Remote")
             .put("IndexNumber", e + 1)
             .put("ParentIndexNumber", f + 1)
-            .put("SeasonId", seasonId(d.vod.id, f))
+            .put("SeasonId", seasonId(d.vod.site, d.vod.id, f))
             .put("SeasonName", d.flags.getOrElse(f) { "线路${f + 1}" })
-            .put("SeriesId", seriesId(d.vod.id))
+            .put("SeriesId", seriesId(d.vod))
             .put("SeriesName", d.vod.name)
-            .put("ParentId", seasonId(d.vod.id, f))
+            .put("ParentId", seasonId(d.vod.site, d.vod.id, f))
             .put("UserData", userData(false))
             .put("ImageTags", imageTags(d.vod.pic))
             .apply { if (d.vod.pic.isNotBlank()) put("SeriesPrimaryImageTag", md5(d.vod.pic).take(16)) }
-            .apply { if (withSources) put("MediaSources", JSONArray().put(mediaSource(id, null))) }
+            .apply { if (withSources) put("MediaSources", JSONArray().put(mediaSource(id, null, 0))) }
     }
 
     private fun people(d: Detail): JSONArray {
@@ -460,15 +469,21 @@ object JellyfinApi {
 
     // ---------- playback ----------
 
-    private fun mediaSource(itemId: String, r: Resolved?): JSONObject {
-        val container = r?.url?.let { containerOf(it) } ?: "mp4"
+    /**
+     * One MediaSource per quality when the spider returns a url array (["1080P","u1","720P","u2"]),
+     * so the player's version/source menu can switch between them.
+     */
+    private fun mediaSource(itemId: String, r: Resolved?, index: Int): JSONObject {
+        val q = r?.qualities?.getOrNull(index)
+        val container = q?.second?.let { containerOf(it) } ?: "mp4"
+        val msId = if (index == 0) itemId else qualityId(itemId, index)
         return JSONObject()
             .put("Protocol", "Http")
-            .put("Id", itemId)
-            .put("Path", "$base/Videos/$itemId/stream?static=true&MediaSourceId=$itemId")
+            .put("Id", msId)
+            .put("Path", "$base/Videos/$itemId/stream?static=true&MediaSourceId=$msId")
             .put("Type", "Default")
             .put("Container", container)
-            .put("Name", "SpiderHost")
+            .put("Name", q?.first?.ifBlank { null } ?: "SpiderHost")
             .put("IsRemote", true)
             .put("ReadAtNativeFramerate", false)
             .put("IgnoreDts", false)
@@ -488,6 +503,9 @@ object JellyfinApi {
             .put("RequiredHttpHeaders", JSONObject())
     }
 
+    private val qualityIds = ConcurrentHashMap<String, Pair<String, Int>>()
+    private fun qualityId(itemId: String, i: Int) = md5("$itemId|q$i").also { qualityIds[it] = itemId to i }
+
     private fun containerOf(url: String): String {
         val p = url.substringBefore('?').lowercase()
         return when {
@@ -501,9 +519,9 @@ object JellyfinApi {
 
     private fun playbackInfo(id: String): JSONObject {
         val r = resolve(id)
-        DiagLog.w("[JF] PlaybackInfo $id -> ${r?.url?.take(200) ?: "无地址"} headers=${r?.headers?.keys}")
+        DiagLog.w("[JF] PlaybackInfo $id -> ${r?.qualities?.joinToString { "${it.first}=${it.second.take(120)}" } ?: "无地址"} headers=${r?.headers?.keys}")
         return JSONObject()
-            .put("MediaSources", JSONArray().apply { if (r != null) put(mediaSource(id, r)) })
+            .put("MediaSources", JSONArray().apply { r?.qualities?.indices?.forEach { put(mediaSource(id, r, it)) } })
             .put("PlaySessionId", md5("ps|$id|${System.currentTimeMillis()}"))
             .apply { if (r == null) put("ErrorCode", "NoCompatibleStream") }
     }
@@ -513,92 +531,115 @@ object JellyfinApi {
         val key = lookup(id)?.takeIf { it.getOrNull(1) == "episode" } ?: run {
             DiagLog.w("[JF] resolve: $id 不是剧集 id"); return null
         }
-        val d = detail(key[2]) ?: return null
+        val site = key[0]
+        val d = detail(site, key[2]) ?: return null
         val f = key[3].toInt(); val e = key[4].toInt()
         val flag = d.flags.getOrNull(f) ?: return null
         val epId = d.episodes.getOrNull(f)?.getOrNull(e)?.second ?: return null
-        val player = JfBackend.call("playerContent($flag)") { it.playerContent(flag, epId, emptyList()) }
+        val player = SpiderHub.on(site, "playerContent($flag)", 60) { it.playerContent(flag, epId, emptyList()) }
         DiagLog.w("[JF] playerContent=${player?.take(1000)}")
         val p = runCatching { JsonParser.parseString(player).asJsonObject }.getOrNull() ?: return null
         val parse = p.intOf("parse"); val jx = p.intOf("jx")
-        if (parse == 1 || jx == 1) { DiagLog.w("[JF] 不兼容：parse/jx=1"); return null }
-        val urlEl = p.get("url")
-        var url = when {
-            urlEl == null || urlEl.isJsonNull -> ""
-            urlEl.isJsonArray -> urlEl.asJsonArray.let { a -> if (a.size() >= 2) a[1].asString else "" } // ["清晰度名", "url", ...]
-            else -> urlEl.asString
-        }
-        if (url.startsWith("[")) url = runCatching { JsonParser.parseString(url).asJsonArray[1].asString }.getOrDefault(url)
-        if (!url.startsWith("http")) {
-            DiagLog.w("[JF] 无可用 http 地址: ${url.take(100)} msg=${p.get("msg")}")
+        if (parse == 1 || jx == 1) { DiagLog.w("[JF] 不兼容：parse/jx=1（需要网页嗅探/解析）"); return null }
+        val qualities = qualitiesOf(p)
+        if (qualities.isEmpty()) {
+            DiagLog.w("[JF] 无可用 http 地址: url=${p.get("url")?.toString()?.take(200)} msg=${p.get("msg")}")
             return null
         }
-        return Resolved(url, headerMap(p), System.currentTimeMillis()).also { resolved[id] = it }
+        // A play URL that points back at 127.0.0.1:9978/proxy must reach this site's spider/jar.
+        SpiderHub.activateForProxy(site)
+        return Resolved(qualities, headerMap(p), System.currentTimeMillis()).also { resolved[id] = it }
+    }
+
+    /** "url" may be a string, a JSON array, or a string holding a JSON array: ["name1","url1","name2","url2",...]. */
+    private fun qualitiesOf(p: JsonObject): List<Pair<String, String>> {
+        val el = p.get("url") ?: return emptyList()
+        if (el.isJsonNull) return emptyList()
+        val arr = when {
+            el.isJsonArray -> el.asJsonArray
+            el.asString.trim().startsWith("[") -> runCatching { JsonParser.parseString(el.asString).asJsonArray }.getOrNull()
+            else -> null
+        }
+        val out = mutableListOf<Pair<String, String>>()
+        if (arr != null) {
+            val items = arr.map { if (it.isJsonPrimitive) it.asString else it.toString() }
+            var i = 0
+            while (i + 1 < items.size) { out += items[i] to items[i + 1]; i += 2 }
+        } else out += "" to el.asString
+        return out.filter { it.second.startsWith("http") }
     }
 
     private fun stream(s: IHTTPSession, id: String): Response {
-        val r = resolve(id) ?: return text(Response.Status.NOT_FOUND, "no playable url")
-        if (r.headers.isEmpty()) {
-            DiagLog.w("[JF] stream $id -> 302 ${r.url.take(200)}")
-            return redirect(r.url)
+        val ms = s.parameters["MediaSourceId"]?.firstOrNull() ?: s.parameters["mediaSourceId"]?.firstOrNull()
+        val (itemId, qi) = ms?.let { qualityIds[it.lowercase()] } ?: (id to 0)
+        val r = resolve(itemId) ?: return text(Response.Status.NOT_FOUND, "no playable url")
+        val url = r.qualities.getOrNull(qi)?.second ?: r.qualities[0].second
+        val local = url.startsWith("http://127.0.0.1:${LocalServer.PORT}/")
+        if (r.headers.isEmpty() || local) {
+            DiagLog.w("[JF] stream $itemId q$qi -> 302 ${url.take(200)}")
+            return redirect(url)
         }
-        // Headers required: pass the bytes through with the spider's headers (works for single-file MP4/MKV/FLV).
-        if (containerOf(r.url) == "hls") DiagLog.w("[JF] WARNING: HLS 且需要请求头，分片不会带头，可能播放失败（待做 m3u8 改写）")
-        val b = Request.Builder().url(r.url)
-        r.headers.forEach { (k, v) -> b.header(k, v) }
-        s.headers["range"]?.let { b.header("Range", it) }
-        val resp = http.newCall(b.build()).execute()
-        val code = resp.code
-        val mime = resp.header("Content-Type") ?: "application/octet-stream"
-        val bodyStream = resp.body?.byteStream() ?: return text(Response.Status.INTERNAL_ERROR, "empty upstream")
-        val len = resp.header("Content-Length")?.toLongOrNull()
-        val out = if (len != null) NanoHTTPD.newFixedLengthResponse(status(code), mime, bodyStream, len)
-        else NanoHTTPD.newChunkedResponse(status(code), mime, bodyStream)
-        listOf("Content-Range", "Accept-Ranges").forEach { k -> resp.header(k)?.let { out.addHeader(k, it) } }
-        DiagLog.w("[JF] stream $id passthrough upstream=$code len=$len")
-        return out
+        return HlsRelay.fetch(s, url, r.headers, "[JF] stream $itemId q$qi")
     }
 
     private fun image(id: String): Response {
         val key = lookup(id) ?: return text(Response.Status.NOT_FOUND, "unknown id")
-        val vodId = key.getOrNull(2) ?: return text(Response.Status.NOT_FOUND, "no image")
-        val pic = if (key[1] == "view") "" else (vods[vodId]?.pic ?: details[vodId]?.vod?.pic).orEmpty()
+        val kind = key.getOrNull(1)
+        if (kind != "series" && kind != "season" && kind != "episode") return text(Response.Status.NOT_FOUND, "no image")
+        val k = key[0] + "|" + key[2]
+        val pic = (vods[k]?.pic ?: details[k]?.vod?.pic).orEmpty()
         return if (pic.startsWith("http")) redirect(pic) else text(Response.Status.NOT_FOUND, "no image")
     }
 
     // ---------- spider calls ----------
 
+    private data class SearchHit(val at: Long, val list: List<Vod>)
+    private val searches = ConcurrentHashMap<String, SearchHit>()
+
+    /** Global search: every enabled searchable site in parallel, 15 s overall, results tagged with the site name. */
     private fun search(term: String): List<Vod> {
-        val res = JfBackend.call("searchContent($term)") { it.searchContent(term, false) }
-        DiagLog.w("[JF] searchContent len=${res?.length}")
-        return parseList(res)
+        searches[term]?.takeIf { System.currentTimeMillis() - it.at < 10 * 60_000 }?.let { return it.list }
+        val keys = SpiderHub.served().filter { it.searchable }.map { it.key }
+        val started = System.currentTimeMillis()
+        val results = SpiderHub.fanOut(keys, 15) { k ->
+            parseList(k, SpiderHub.on(k, "searchContent($term)", 12) { it.searchContent(term, false) })
+        }
+        val byKey = results.toMap()
+        // Keep config order so the user's preferred sites come first.
+        val list = keys.flatMap { k -> byKey[k].orEmpty().map { it.copy(name = "${it.name} · ${SpiderHub.shortName(k)}") } }
+        DiagLog.w("[JF] 搜索「$term」${keys.size} 站，${results.count { it.second.isNotEmpty() }} 站有结果，共 ${list.size} 条，用时 ${System.currentTimeMillis() - started} ms")
+        if (list.isNotEmpty()) searches[term] = SearchHit(System.currentTimeMillis(), list)
+        return list
     }
 
     private val pageSizes = ConcurrentHashMap<String, Int>()
     private val pages = ConcurrentHashMap<String, Pair<List<Vod>, Int>>()
 
     /** Returns (vods, pagecount). */
-    private fun category(tid: String, page: Int): Pair<List<Vod>, Int> {
-        pages["$tid|$page"]?.let { return it }
-        val res = JfBackend.call("categoryContent($tid,$page)") { it.categoryContent(tid, page.toString(), false, HashMap()) }
+    private fun category(site: String, tid: String, page: Int): Pair<List<Vod>, Int> {
+        val ck = "$site|$tid|$page"
+        pages[ck]?.let { return it }
+        val res = SpiderHub.on(site, "categoryContent($tid,$page)") { it.categoryContent(tid, page.toString(), false, HashMap()) }
         val obj = runCatching { JsonParser.parseString(res).asJsonObject }.getOrNull()
-        val list = parseList(res)
+        val list = parseList(site, res)
         val pageCount = obj?.intOf("pagecount")?.takeIf { it > 0 } ?: (if (list.isEmpty()) page - 1 else page + 1)
-        if (page == 1 && list.isNotEmpty()) pageSizes[tid] = list.size
-        return (list to pageCount).also { pages["$tid|$page"] = it }
+        if (page == 1 && list.isNotEmpty()) pageSizes["$site|$tid"] = list.size
+        val out = list to pageCount
+        if (list.isNotEmpty()) pages[ck] = out
+        return out
     }
 
     /** Jellyfin pages by StartIndex/Limit, CatVod by page number: map the window onto CatVod pages. */
-    private fun categoryWindow(tid: String, start: Int, limit: Int?): Pair<List<Vod>, Int> {
-        val first = category(tid, 1)
-        val size = pageSizes[tid] ?: return emptyList<Vod>() to 0
+    private fun categoryWindow(site: String, tid: String, start: Int, limit: Int?): Pair<List<Vod>, Int> {
+        val first = category(site, tid, 1)
+        val size = pageSizes["$site|$tid"] ?: return emptyList<Vod>() to 0
         val want = limit ?: size
         val out = mutableListOf<Vod>()
         var page = start / size + 1
         var skip = start % size
         var pageCount = first.second
         while (out.size < want) {
-            val (list, pc) = category(tid, page)
+            val (list, pc) = category(site, tid, page)
             pageCount = pc
             if (list.isEmpty()) break
             out += list.drop(skip)
@@ -610,12 +651,15 @@ object JellyfinApi {
         return out.take(want) to maxOf(total, start + out.size)
     }
 
-    private fun detail(vodId: String): Detail? {
-        details[vodId]?.let { return it }
-        val res = JfBackend.call("detailContent($vodId)") { it.detailContent(listOf(vodId)) }
+    private fun detail(site: String, vodId: String): Detail? {
+        val k = "$site|$vodId"
+        details[k]?.let { return it }
+        val res = SpiderHub.on(site, "detailContent($vodId)") { it.detailContent(listOf(vodId)) }
         val o = runCatching { JsonParser.parseString(res).asJsonObject.getAsJsonArray("list")[0].asJsonObject }.getOrNull()
             ?: run { DiagLog.w("[JF] detail 无 list[0]: ${res?.take(300)}"); return null }
-        val v = toVod(o) ?: return null
+        val v = toVod(site, o) ?: return null
+        // Search results carry a "· 站点" suffix; keep it so the user sees which source they are in.
+        val shown = vods[k]?.name?.takeIf { it.startsWith(v.name) } ?: v.name
         val flags = o.str("vod_play_from").split("$$$")
         val groups = o.str("vod_play_url").split("$$$")
         val eps = flags.indices.map { i ->
@@ -623,19 +667,19 @@ object JellyfinApi {
                 if ('$' in ep) ep.substringBefore('$') to ep.substringAfter('$') else ep to ep
             }
         }
-        return Detail(v, o.str("vod_content"), o.str("vod_actor"), o.str("vod_director"), flags, eps)
-            .also { details[vodId] = it; vods[vodId] = v }
+        return Detail(v.copy(name = shown), o.str("vod_content"), o.str("vod_actor"), o.str("vod_director"), flags, eps)
+            .also { details[k] = it; if (vods[k] == null) vods[k] = v }
     }
 
-    private fun parseList(json: String?): List<Vod> = runCatching {
+    private fun parseList(site: String, json: String?): List<Vod> = runCatching {
         JsonParser.parseString(json).asJsonObject.getAsJsonArray("list").mapNotNull { el ->
-            el.takeIf { it.isJsonObject }?.asJsonObject?.let { toVod(it) }
+            el.takeIf { it.isJsonObject }?.asJsonObject?.let { toVod(site, it) }
         }
-    }.getOrDefault(emptyList()).onEach { vods[it.id] = it }
+    }.getOrDefault(emptyList()).onEach { vods.putIfAbsent("$site|${it.id}", it) }
 
-    private fun toVod(o: JsonObject): Vod? {
+    private fun toVod(site: String, o: JsonObject): Vod? {
         val id = o.str("vod_id").ifBlank { return null }
-        return Vod(id, o.str("vod_name"), o.str("vod_pic"), o.str("vod_remarks"), o.str("vod_year"))
+        return Vod(site, id, o.str("vod_name"), o.str("vod_pic"), o.str("vod_remarks"), o.str("vod_year"))
     }
 
     private fun headerMap(p: JsonObject): Map<String, String> {

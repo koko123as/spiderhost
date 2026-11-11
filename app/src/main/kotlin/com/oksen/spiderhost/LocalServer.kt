@@ -23,10 +23,11 @@ class LocalServer : NanoHTTPD("127.0.0.1", PORT) {
                 .put("siteKey", SpiderSession.siteKey ?: JSONObject.NULL)
                 .put("spiderLoaded", SpiderSession.spider != null)
                 .put("staticProxy", SpiderSession.staticProxy != null)
-                .put("jellyfinSite", JfBackend.siteKey)
-                .put("jellyfinReady", JfBackend.spider != null)
-                .put("classes", JfBackend.classes.size))
+                .put("homeSite", SpiderHub.homeKey)
+                .put("jellyfinReady", SpiderHub.ready)
+                .put("servedSites", SpiderHub.served().size))
             "/proxy" -> proxy(session)
+            "/hls" -> HlsRelay.serve(session)
             // Everything else is the Jellyfin-compatible API (stage 2); it logs every request itself.
             else -> JellyfinApi.handle(session, session.uri)
         }
