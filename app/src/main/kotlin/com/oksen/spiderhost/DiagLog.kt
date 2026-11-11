@@ -12,7 +12,7 @@ object DiagLog {
     private const val TAG = "SpiderHost"
     private const val MAX_BYTES = 4L * 1024 * 1024
     private val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
-    private var files: List<File> = emptyList()
+    @Volatile private var files: List<File> = emptyList()
     @Volatile var listener: ((String) -> Unit)? = null
 
     fun init(context: Context) {
@@ -27,12 +27,32 @@ object DiagLog {
 
     val primaryFile: File? get() = files.firstOrNull()
 
-    @Synchronized
+    // Lines are written by one background thread, so request threads never wait on file I/O or each other.
+    private val pending = java.util.concurrent.LinkedBlockingQueue<String>()
+    private val writer = Thread({
+        while (true) {
+            val first = runCatching { pending.take() }.getOrNull() ?: continue
+            val batch = StringBuilder(first)
+            while (true) { val next = pending.poll() ?: break; batch.append(next); if (batch.length > 64_000) break }
+            val text = batch.toString()
+            files.forEach { runCatching { it.appendText(text) } }
+            synchronized(pending) { (pending as Object).notifyAll() }
+        }
+    }, "diaglog-writer").apply { isDaemon = true; start() }
+
     fun w(msg: String) {
         Log.i(TAG, msg)
-        val line = "${fmt.format(Date())} [${Thread.currentThread().name}] $msg\n"
-        files.forEach { runCatching { it.appendText(line) } }
+        val line = synchronized(fmt) { fmt.format(Date()) } + " [${Thread.currentThread().name}] $msg\n"
+        pending.offer(line)
         listener?.invoke(line)
+    }
+
+    /** Waits (briefly) until queued lines are on disk. */
+    fun flush() {
+        val until = System.currentTimeMillis() + 500
+        synchronized(pending) {
+            while (pending.isNotEmpty() && System.currentTimeMillis() < until) (pending as Object).wait(50)
+        }
     }
 
     fun e(msg: String, t: Throwable?) {
@@ -47,9 +67,10 @@ object DiagLog {
         sw.toString()
     }
 
-    fun readAll(): String = primaryFile?.takeIf { it.exists() }?.readText().orEmpty()
+    fun readAll(): String = flush().let { primaryFile }?.takeIf { it.exists() }?.readText().orEmpty()
 
     fun clear() {
+        flush()
         files.forEach { runCatching { it.writeText("") } }
     }
 }

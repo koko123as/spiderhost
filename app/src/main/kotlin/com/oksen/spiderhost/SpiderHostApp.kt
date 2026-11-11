@@ -36,7 +36,7 @@ class SpiderHostApp : Application() {
     private fun installCrashHandler() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
-            runCatching { DiagLog.e("UNCAUGHT on thread ${thread.name}", error) }
+            runCatching { DiagLog.e("UNCAUGHT on thread ${thread.name}", error); DiagLog.flush() }
             // Flyme's screen-recognition picker (com.meizu.internal.picker) crashes inside our process on its own
             // "ContentCapture" thread; that is not our code, so log it and keep the process (and the server) alive.
             val systemOnly = error.stackTrace.any { it.className.startsWith("com.meizu.internal.") }

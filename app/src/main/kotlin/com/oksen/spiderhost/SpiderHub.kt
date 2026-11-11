@@ -109,9 +109,33 @@ object SpiderHub {
         }
     }
 
-    fun <T> on(key: String, label: String, timeoutSec: Long = 30, block: (Spider) -> T): T? {
+    // ---------- per-site load control ----------
+    // A site gets at most SITE_SLOTS spider calls at once. A slot is released when the call really ends,
+    // not when we stop waiting for it, so calls that hang past their timeout still count against the site.
+    private const val SITE_SLOTS = 4
+    private val slots = ConcurrentHashMap<String, java.util.concurrent.Semaphore>()
+    private val foreground = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+
+    /** Number of user-facing (non-backfill) spider calls running for [key] right now. */
+    fun foregroundBusy(key: String): Int = foreground[key]?.get() ?: 0
+
+    fun <T> on(key: String, label: String, timeoutSec: Long = 30, background: Boolean = false, block: (Spider) -> T): T? {
         val rt = rt(key) ?: return null
-        return call("$key $label", rt.loader, timeoutSec) { block(rt.spider) }
+        val sem = slots.getOrPut(key) { java.util.concurrent.Semaphore(SITE_SLOTS, true) }
+        val fg = foreground.getOrPut(key) { java.util.concurrent.atomic.AtomicInteger() }
+        val waitStart = System.currentTimeMillis()
+        if (!sem.tryAcquire(timeoutSec, TimeUnit.SECONDS)) {
+            DiagLog.w("[$key $label] BUSY: 站点 $SITE_SLOTS 个调用都未结束，等待 ${timeoutSec}s 后放弃")
+            return null
+        }
+        val waited = System.currentTimeMillis() - waitStart
+        if (waited > 1000) DiagLog.w("[$key $label] 排队 $waited ms")
+        val left = (timeoutSec * 1000 - waited).coerceAtLeast(1000)
+        if (!background) fg.incrementAndGet()
+        return call("$key $label", rt.loader, left, TimeUnit.MILLISECONDS, onEnd = {
+            sem.release()
+            if (!background) fg.decrementAndGet()
+        }) { block(rt.spider) }
     }
 
     /** Points /proxy at this site's spider and jar (the one whose play URL is about to be used). */
@@ -125,7 +149,7 @@ object SpiderHub {
 
     fun classesOf(key: String): List<Pair<String, String>> {
         classes[key]?.let { return it }
-        val home = on(key, "homeContent", 30) { it.homeContent(true) }
+        val home = on(key, "homeContent", 15) { it.homeContent(true) }
         val list = runCatching {
             JsonParser.parseString(home).asJsonObject.getAsJsonArray("class").map {
                 val o = it.asJsonObject
@@ -153,18 +177,27 @@ object SpiderHub {
         return out
     }
 
-    fun <T> call(label: String, loader: ClassLoader, timeoutSec: Long, block: () -> T): T? {
+    fun <T> call(label: String, loader: ClassLoader, timeoutSec: Long, block: () -> T): T? =
+        call(label, loader, timeoutSec, TimeUnit.SECONDS, null, block)
+
+    fun <T> call(label: String, loader: ClassLoader, timeout: Long, unit: TimeUnit, onEnd: (() -> Unit)?, block: () -> T): T? {
         val started = System.currentTimeMillis()
-        val f = pool.submit<T> {
-            val t = Thread.currentThread()
-            val prev = t.contextClassLoader
-            t.contextClassLoader = loader
-            try { block() } finally { t.contextClassLoader = prev }
-        }
+        val f = try {
+            pool.submit<T> {
+                val t = Thread.currentThread()
+                val prev = t.contextClassLoader
+                t.contextClassLoader = loader
+                try { block() } finally { t.contextClassLoader = prev; onEnd?.invoke() }
+            }
+        } catch (t: Throwable) { onEnd?.invoke(); throw t }
         return try {
-            f.get(timeoutSec, TimeUnit.SECONDS).also { DiagLog.w("[$label] ok in ${System.currentTimeMillis() - started} ms") }
+            f.get(timeout, unit).also {
+                val ms = System.currentTimeMillis() - started
+                DiagLog.w("[$label] ok in $ms ms" + if (ms > 5000) " SLOW" else "")
+            }
         } catch (e: TimeoutException) {
-            f.cancel(true); DiagLog.w("[$label] TIMEOUT after ${timeoutSec}s"); null
+            // cancel(true) only interrupts; the spider thread may keep running until it returns (onEnd fires then).
+            f.cancel(true); DiagLog.w("[$label] TIMEOUT after ${unit.toMillis(timeout) / 1000}s"); null
         } catch (e: ExecutionException) {
             val c = SpiderRunner.unwrap(e); DiagLog.e("[$label] FAILED: ${SpiderRunner.classify(c)}", c); null
         } catch (e: InterruptedException) {

@@ -52,6 +52,7 @@ object JellyfinApi {
     private var idFile: File? = null
 
     fun init(dir: File) {
+        imgDir = File(dir, "jf-img").apply { mkdirs() }
         val f = File(dir, "jf-ids.tsv")
         idFile = f
         if (f.exists()) f.forEachLine { line ->
@@ -135,7 +136,8 @@ object JellyfinApi {
             DiagLog.e("[JF] $rawPath failed", t)
             text(Response.Status.INTERNAL_ERROR, DiagLog.fullTrace(t))
         }
-        DiagLog.w("[JF] -> ${resp.status.requestStatus} ${resp.mimeType} in ${System.currentTimeMillis() - started} ms")
+        val ms = System.currentTimeMillis() - started
+        DiagLog.w("[JF] -> ${resp.status.requestStatus} ${resp.mimeType} in $ms ms" + if (ms > 5000) " SLOW $rawPath" else "")
         return resp
     }
 
@@ -429,7 +431,7 @@ object JellyfinApi {
         .put("MediaType", "Unknown")
         .put("LocationType", "Remote")
         .put("UserData", userData(false))
-        .put("ImageTags", imageTags(v.pic))
+        .put("ImageTags", imageTags(knownPic(v.site, v.id) ?: v.pic))
         .put("BackdropImageTags", JSONArray())
         .apply { v.year.toIntOrNull()?.let { put("ProductionYear", it) } }
         .apply { if (d != null) {
@@ -625,16 +627,23 @@ object JellyfinApi {
             "series", "season", "episode" -> listOf(key[0] to key[2])
             else -> return text(Response.Status.NOT_FOUND, "no image")
         }
-        val pic = targets.firstNotNullOfOrNull { (s, v) -> picOf(s, v, false) }
-            ?: targets.firstNotNullOfOrNull { (s, v) -> picOf(s, v, true) }
+        // Never call detailContent on this thread: a page of posterless items used to fire one detail call
+        // per poster at the site, which starved the detail the user had actually opened (详情加载失败).
+        // Missing pictures go to a small background queue instead; we wait for it briefly.
+        val pic = targets.firstNotNullOfOrNull { (s, v) -> picOf(s, v) }
+            ?: targets.firstOrNull()?.let { (s, v) -> PicBackfill.await(s, v, 5_000); picOf(s, v) }
             ?: return text(Response.Status.NOT_FOUND, "no image")
         return fetchImage(pic)
     }
 
-    private fun picOf(site: String, vodId: String, loadDetail: Boolean): String? {
+    /** The picture already known for a vod (list or cached detail), as stored. Never loads anything. */
+    private fun knownPic(site: String, vodId: String): String? {
         val k = "$site|$vodId"
-        val p = (vods[k]?.pic?.takeIf { it.isNotBlank() } ?: details[k]?.vod?.pic?.takeIf { it.isNotBlank() }
-            ?: if (loadDetail) detail(site, vodId)?.vod?.pic else null)?.trim()
+        return vods[k]?.pic?.takeIf { it.isNotBlank() } ?: details[k]?.vod?.pic?.takeIf { it.isNotBlank() }
+    }
+
+    private fun picOf(site: String, vodId: String): String? {
+        val p = knownPic(site, vodId)?.trim()
         return when {
             p.isNullOrBlank() -> null
             p.startsWith("//") -> "https:$p"
@@ -643,7 +652,97 @@ object JellyfinApi {
         }
     }
 
+    /**
+     * Fills missing posters from detailContent in the background: at most 2 at a time over all sites,
+     * newest request first (what is on screen now), skipped while the site is serving a user request,
+     * and capped at 60 queued items so a long scroll does not leave a backlog hammering the site.
+     */
+    private object PicBackfill {
+        private const val MAX_QUEUE = 60
+        private val queue = java.util.concurrent.LinkedBlockingDeque<String>()
+        private val waiters = ConcurrentHashMap<String, java.util.concurrent.CountDownLatch>()
+        private val workers = List(2) { i ->
+            Thread({ loop() }, "pic-backfill-$i").apply { isDaemon = true; start() }
+        }
+
+        fun await(site: String, vodId: String, ms: Long) {
+            val k = "$site|$vodId"
+            if (failedRecently(k)) return
+            val fresh = java.util.concurrent.CountDownLatch(1)
+            val latch = waiters.putIfAbsent(k, fresh) ?: fresh
+            // Move to the front either way: it is on screen now.
+            queue.remove(k); queue.offerFirst(k)
+            while (queue.size > MAX_QUEUE) queue.pollLast()?.let { dropped -> waiters.remove(dropped)?.countDown() }
+            latch.await(ms, TimeUnit.MILLISECONDS)
+        }
+
+        private fun loop() {
+            while (true) {
+                val k = runCatching { queue.takeFirst() }.getOrNull() ?: continue
+                val site = k.substringBefore('|'); val vodId = k.substringAfter('|')
+                try {
+                    // Let the site finish what the user is waiting for first.
+                    var spins = 0
+                    while (SpiderHub.foregroundBusy(site) > 0 && spins++ < 40) Thread.sleep(250)
+                    if (knownPic(site, vodId) == null && !failedRecently(k)) detail(site, vodId, background = true)
+                } catch (t: Throwable) {
+                    DiagLog.w("[JF] 补封面失败 $k: $t")
+                } finally {
+                    waiters.remove(k)?.countDown()
+                }
+            }
+        }
+    }
+
+    // ---------- poster bytes cache (memory + disk) ----------
+    private val imgMem = object : android.util.LruCache<String, Pair<String, ByteArray>>(12 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Pair<String, ByteArray>) = value.second.size
+    }
+    private var imgDir: File? = null
+    private const val IMG_DISK_MAX = 50L * 1024 * 1024
+
+    private val imgHttp = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(15, TimeUnit.SECONDS)
+        .followRedirects(true)
+        .build()
+
+    private fun imageResponse(type: String, bytes: ByteArray): Response =
+        NanoHTTPD.newFixedLengthResponse(Response.Status.OK, type, java.io.ByteArrayInputStream(bytes), bytes.size.toLong())
+            .apply { addHeader("Cache-Control", "public, max-age=86400") }
+
+    private fun cachedImage(raw: String): Pair<String, ByteArray>? {
+        val k = md5(raw)
+        imgMem.get(k)?.let { return it }
+        val f = imgDir?.let { File(it, k) } ?: return null
+        if (!f.exists()) return null
+        return runCatching {
+            val bytes = f.readBytes()
+            val type = File(f.parentFile, "$k.type").takeIf { it.exists() }?.readText() ?: "image/jpeg"
+            f.setLastModified(System.currentTimeMillis())
+            (type to bytes).also { imgMem.put(k, it) }
+        }.getOrNull()
+    }
+
+    private fun storeImage(raw: String, type: String, bytes: ByteArray) {
+        val k = md5(raw)
+        imgMem.put(k, type to bytes)
+        val dir = imgDir ?: return
+        runCatching {
+            File(dir, "$k.type").writeText(type)
+            File(dir, k).writeBytes(bytes)
+            val files = dir.listFiles { f -> !f.name.endsWith(".type") }.orEmpty()
+            var total = files.sumOf { it.length() }
+            if (total > IMG_DISK_MAX) files.sortedBy { it.lastModified() }.forEach { f ->
+                if (total <= IMG_DISK_MAX * 8 / 10) return@forEach
+                total -= f.length(); f.delete(); File(dir, "${f.name}.type").delete()
+            }
+        }
+    }
+
     private fun fetchImage(raw: String): Response {
+        cachedImage(raw)?.let { (type, bytes) -> return imageResponse(type, bytes) }
         val parts = raw.split('@')
         val url = parts[0]
         val headers = LinkedHashMap<String, String>()
@@ -655,15 +754,15 @@ object JellyfinApi {
         return try {
             val b = Request.Builder().url(url)
             headers.forEach { (k, v) -> b.header(k, v) }
-            http.newCall(b.build()).execute().use { r ->
+            imgHttp.newCall(b.build()).execute().use { r ->
                 val bytes = r.body?.bytes()
                 if (!r.isSuccessful || bytes == null || bytes.isEmpty()) {
                     DiagLog.w("[JF] 封面 ${r.code} ${url.take(160)}")
                     return text(Response.Status.NOT_FOUND, "no image")
                 }
                 val type = r.header("Content-Type")?.takeIf { it.startsWith("image/") } ?: "image/jpeg"
-                NanoHTTPD.newFixedLengthResponse(Response.Status.OK, type, java.io.ByteArrayInputStream(bytes), bytes.size.toLong())
-                    .apply { addHeader("Cache-Control", "public, max-age=86400") }
+                storeImage(raw, type, bytes)
+                imageResponse(type, bytes)
             }
         } catch (t: Throwable) {
             DiagLog.w("[JF] 封面失败 ${url.take(160)}: $t")
@@ -758,7 +857,7 @@ object JellyfinApi {
         val name = owners["${members[0].first}|${members[0].second}"]
         members.forEach { (s, v) -> owners.putIfAbsent("$s|$v", name ?: (id to (vods["$s|$v"]?.name ?: ""))) }
         val tags = members.map { it.first + "\u0002" + it.second }
-        val got = SpiderHub.fanOut(tags, 30) { t -> detail(t.substringBefore('\u0002'), t.substringAfter('\u0002')) }.toMap()
+        val got = SpiderHub.fanOut(tags, 15) { t -> detail(t.substringBefore('\u0002'), t.substringAfter('\u0002')) }.toMap()
         val list = tags.mapNotNull { got[it] }
         DiagLog.w("[JF] 合并条目 ${members.size} 源，详情成功 ${list.size}")
         if (list.size == members.size) groupCache[id] = list
@@ -772,7 +871,7 @@ object JellyfinApi {
     private fun category(site: String, tid: String, page: Int): Pair<List<Vod>, Int> {
         val ck = "$site|$tid|$page"
         pages[ck]?.let { return it }
-        val res = SpiderHub.on(site, "categoryContent($tid,$page)") { it.categoryContent(tid, page.toString(), false, HashMap()) }
+        val res = SpiderHub.on(site, "categoryContent($tid,$page)", 15) { it.categoryContent(tid, page.toString(), false, HashMap()) }
         val obj = runCatching { JsonParser.parseString(res).asJsonObject }.getOrNull()
         val list = parseList(site, res)
         val pageCount = obj?.intOf("pagecount")?.takeIf { it > 0 } ?: (if (list.isEmpty()) page - 1 else page + 1)
@@ -811,17 +910,36 @@ object JellyfinApi {
      * Without this, each one called detailContent on the spider in parallel; one slow or failed call
      * made SenPlayer show 详情加载失败. Now concurrent callers share one call, and a failure is retried once.
      */
-    private fun detail(site: String, vodId: String): Detail? {
+    // Failed details are remembered for a minute so posters and repeated opens do not keep hitting the site.
+    private val detailFailedAt = ConcurrentHashMap<String, Long>()
+    private const val DETAIL_FAIL_TTL = 60_000L
+    private const val DETAIL_TIMEOUT = 12L
+
+    private fun failedRecently(k: String) =
+        detailFailedAt[k]?.let { System.currentTimeMillis() - it < DETAIL_FAIL_TTL } == true
+
+    /**
+     * SenPlayer gives up on a detail page after roughly 10-20 s, so one attempt gets 12 s; a second attempt
+     * is made only when the first failed fast (an error, not a timeout), so the total stays within that window.
+     */
+    private fun detail(site: String, vodId: String, background: Boolean = false): Detail? {
         val k = "$site|$vodId"
         details[k]?.let { return it }
+        if (!background) detailFailedAt.remove(k)   // the user asked again: try for real
+        else if (failedRecently(k)) return null
         val mine = java.util.concurrent.CompletableFuture<Detail?>()
         val existing = inflight.putIfAbsent(k, mine)
-        if (existing != null) return runCatching { existing.get(70, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull()
+        if (existing != null) return runCatching { existing.get(DETAIL_TIMEOUT * 2 + 2, TimeUnit.SECONDS) }.getOrNull()
         try {
-            val d = loadDetail(site, vodId) ?: run {
-                DiagLog.w("[JF] detail $k 第一次失败，重试一次")
-                loadDetail(site, vodId)
+            val t0 = System.currentTimeMillis()
+            val d = loadDetail(site, vodId, background) ?: run {
+                val ms = System.currentTimeMillis() - t0
+                if (ms < 4000 && !background) {
+                    DiagLog.w("[JF] detail $k 第一次失败（$ms ms），重试一次")
+                    loadDetail(site, vodId, background)
+                } else null
             }
+            if (d == null) detailFailedAt[k] = System.currentTimeMillis()
             mine.complete(d)
             return d
         } catch (t: Throwable) {
@@ -831,9 +949,11 @@ object JellyfinApi {
         }
     }
 
-    private fun loadDetail(site: String, vodId: String): Detail? {
+    private fun loadDetail(site: String, vodId: String, background: Boolean = false): Detail? {
         val k = "$site|$vodId"
-        val res = SpiderHub.on(site, "detailContent($vodId)") { it.detailContent(listOf(vodId)) }
+        val res = SpiderHub.on(site, (if (background) "bg " else "") + "detailContent($vodId)", DETAIL_TIMEOUT, background) {
+            it.detailContent(listOf(vodId))
+        }
         val o = runCatching { JsonParser.parseString(res).asJsonObject.getAsJsonArray("list")[0].asJsonObject }.getOrNull()
             ?: run { DiagLog.w("[JF] detail 无 list[0]: ${res?.take(300)}"); return null }
         val v = toVod(site, o) ?: return null
