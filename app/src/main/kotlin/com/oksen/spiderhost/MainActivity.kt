@@ -45,7 +45,6 @@ class MainActivity : Activity() {
         val pick = Button(this).apply { text = "选择首页站点（服务中可直接切换）" }
         val pickEnabled = Button(this).apply { text = "选择启用站点（搜索 / 全部站点）" }
         val probe = Button(this).apply { text = "探查配置中心（诊断）" }
-        val panOnly = Button(this).apply { text = "只启用网盘站" }
         val login = Button(this).apply { text = "网盘登录（扫码 / 密码）" }
 
         fun loadSites(btn: Button, onOk: (List<TvboxConfig.Site>) -> Unit) {
@@ -83,20 +82,20 @@ class MainActivity : Activity() {
             loadSites(pickEnabled) { all ->
                 val sites = all.filter { SpiderHub.isSupported(it) }
                 val saved = prefs.getStringSet("enabledSites", emptySet())!!
-                val checked = BooleanArray(sites.size) { saved.isEmpty() || sites[it].key in saved }
+                val checked = BooleanArray(sites.size) { if (saved.isEmpty()) SpiderHub.isPan(sites[it]) else sites[it].key in saved }
                 android.app.AlertDialog.Builder(this).setTitle("启用的站点（${sites.size} 个 type-3）")
                     .setMultiChoiceItems(sites.map { "${it.name}  [${it.key}]" }.toTypedArray(), checked) { _, i, on -> checked[i] = on }
                     .setPositiveButton("保存") { _, _ ->
                         val set = sites.filterIndexed { i, _ -> checked[i] }.map { it.key }.toSet()
-                        val store = if (set.size == sites.size) emptySet() else set
+                        val store = set
                         prefs.edit().putStringSet("enabledSites", store).apply()
                         SpiderHub.enabled = store
-                        append("\n启用站点: ${if (store.isEmpty()) "全部 ${sites.size}" else set.size.toString()} 个\n")
+                        append("\n启用站点: ${set.size} 个\n")
                     }
-                    .setNeutralButton("全选") { _, _ ->
+                    .setNeutralButton("默认（全部网盘站）") { _, _ ->
                         prefs.edit().putStringSet("enabledSites", emptySet()).apply()
                         SpiderHub.enabled = emptySet()
-                        append("\n启用站点: 全部 ${sites.size} 个\n")
+                        append("\n启用站点: 默认，全部网盘站 ${sites.count { SpiderHub.isPan(it) }} 个\n")
                     }
                     .setNegativeButton("取消", null)
                     .show()
@@ -111,31 +110,6 @@ class MainActivity : Activity() {
                     .setItems(cands.map { "${it.name}  [${it.key}]" }.toTypedArray()) { _, i ->
                         Thread({ SpiderHub.probeConfigCentre(cands[i].key) }, "probe").start()
                     }
-                    .show()
-            }
-        }
-        panOnly.setOnClickListener {
-            loadSites(panOnly) { all ->
-                val sites = all.filter { SpiderHub.isSupported(it) }
-                val checked = BooleanArray(sites.size) { SpiderHub.isPan(sites[it]) }
-                android.app.AlertDialog.Builder(this).setTitle("网盘站（已按名称勾选 ${checked.count { it }} 个，可修改）")
-                    .setMultiChoiceItems(sites.map { "${it.name}  [${it.key}]" }.toTypedArray(), checked) { _, i, on -> checked[i] = on }
-                    .setPositiveButton("保存") { _, _ ->
-                        val chosen = sites.filterIndexed { i, _ -> checked[i] }
-                        if (chosen.isEmpty()) { append("\n没有勾选任何站点，未保存\n"); return@setPositiveButton }
-                        val set = chosen.map { it.key }.toSet()
-                        prefs.edit().putStringSet("enabledSites", set).apply()
-                        SpiderHub.enabled = set
-                        // The home site is always served, so it must be one of the netdisk sites too.
-                        val home = prefs.getString("siteKey", "")!!
-                        if (home !in set) {
-                            prefs.edit().putString("siteKey", chosen[0].key).apply()
-                            siteKey.setText(chosen[0].key)
-                            if (SpiderHub.ready) SpiderHub.setHome(chosen[0].key)
-                        }
-                        append("\n只启用网盘站 ${set.size} 个: ${chosen.joinToString { it.name }}\n首页站点=${prefs.getString("siteKey", "")}；SenPlayer 里刷新媒体库\n")
-                    }
-                    .setNegativeButton("取消", null)
                     .show()
             }
         }
@@ -156,9 +130,10 @@ class MainActivity : Activity() {
         val serve = Button(this).apply { text = "启动 Jellyfin 服务（全部站点，首页=当前站点）" }
         val share = Button(this).apply { text = "分享日志" }
         val clear = Button(this).apply { text = "清空日志" }
+        val full = Button(this).apply { text = "全屏日志" }
         val buttons = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            listOf(run, share, clear).forEach { addView(it, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)) }
+            listOf(run, full, share, clear).forEach { addView(it, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)) }
         }
 
         output = TextView(this).apply {
@@ -166,14 +141,19 @@ class MainActivity : Activity() {
             textSize = 11f
             setTextIsSelectable(true)
         }
-        scroll = ScrollView(this).apply { addView(output) }
+        scroll = ScrollView(this).apply {
+            addView(output)
+            setPadding(pad / 2, pad / 2, pad / 2, pad / 2)
+            setBackgroundColor(0xFFF1F3F4.toInt())
+        }
 
-        // Controls scroll on their own so the log keeps half the screen on a phone.
+        // Controls take the screen; the log is a small box at the bottom (全屏日志 opens it whole).
         val controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        listOf(configUrl, pick, siteKey, pickEnabled, panOnly, serve, login, probe, buttons, keyword, timeout, fakePkg, preload, forceStd, batch)
+        listOf(configUrl, pick, siteKey, pickEnabled, serve, login, probe, buttons, keyword, timeout, fakePkg, preload, forceStd, batch)
             .forEach { controls.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
         root.addView(ScrollView(this).apply { addView(controls) }, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, (150 * resources.displayMetrics.density).toInt())
+            .apply { topMargin = pad / 2 })
         setContentView(root)
 
         output.text = DiagLog.readAll().takeLast(60_000)
@@ -229,6 +209,21 @@ class MainActivity : Activity() {
                 type = "text/plain"
                 putExtra(Intent.EXTRA_TEXT, text)
             }, "分享 SpiderHost 日志"))
+        }
+        full.setOnClickListener {
+            val tv = TextView(this).apply {
+                typeface = Typeface.MONOSPACE
+                textSize = 11f
+                setTextIsSelectable(true)
+                setPadding(pad, pad, pad, pad)
+                text = DiagLog.readAll().takeLast(200_000)
+            }
+            val sv = ScrollView(this).apply { addView(tv) }
+            android.app.Dialog(this, android.R.style.Theme_Material_Light_NoActionBar).apply {
+                setContentView(sv)
+                show()
+            }
+            sv.post { sv.fullScroll(ScrollView.FOCUS_DOWN) }
         }
         clear.setOnClickListener {
             DiagLog.clear()
