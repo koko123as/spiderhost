@@ -171,6 +171,45 @@ object SpiderHub {
         }
     }
 
+    private val PAN = Regex("盘|夸克|迅雷|百度|天翼|光鸭|阿里|移动云|115|123|UC|(?i:quark|thunder|baidu|aliyun|alipan|pikpak|pan|cloud189)")
+
+    /** Netdisk sites by name/key/api (a guess the user confirms in the picker); the config centre itself is excluded. */
+    fun isPan(s: TvboxConfig.Site): Boolean =
+        isSupported(s) && !isConfigCentre(s) && (PAN.containsMatchIn(s.name) || PAN.containsMatchIn(s.key) || PAN.containsMatchIn(s.api))
+
+    fun isConfigCentre(s: TvboxConfig.Site) = s.name.contains("配置") || s.key.contains("config", true)
+
+    /**
+     * Starts the config-centre spider (which serves its own login page) and returns the page URL.
+     * The URL is read from the spider's own detail text ("请打开网页版配置中心：http://x:19988/config");
+     * 127.0.0.1 with the same port is tried first since the page runs on this phone.
+     */
+    fun loginPageUrl(): String? {
+        val cc = sites.firstOrNull { isSupported(it) && isConfigCentre(it) } ?: run { DiagLog.w("LOGIN: 配置里没有配置中心站点"); return null }
+        val cls = classesOf(cc.key)
+        val re = Regex("https?://[0-9A-Za-z.\\-]+:\\d+/[^\\s\"'<，。]*")
+        var found: String? = null
+        for ((tid, _) in cls.filter { it.first != "diy" }.take(4)) {
+            val cat = on(cc.key, "login category $tid") { it.categoryContent(tid, "1", false, HashMap()) } ?: continue
+            found = re.find(cat)?.value
+            if (found != null) break
+            val vid = runCatching { JsonParser.parseString(cat).asJsonObject.getAsJsonArray("list")[0].asJsonObject.get("vod_id").asString }.getOrNull() ?: continue
+            val d = on(cc.key, "login detail $vid") { it.detailContent(listOf(vid)) } ?: continue
+            found = re.find(d)?.value
+            if (found != null) break
+        }
+        DiagLog.w("LOGIN: 配置中心 ${cc.key} 给出的地址 $found")
+        val port = found?.let { runCatching { java.net.URI(it).port }.getOrNull() }?.takeIf { it > 0 } ?: 19988
+        val path = found?.let { runCatching { java.net.URI(it).rawPath }.getOrNull() }?.ifBlank { null } ?: "/config"
+        val local = "http://127.0.0.1:$port$path"
+        val ok = runCatching {
+            okhttp3.OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS).readTimeout(5, TimeUnit.SECONDS).build()
+                .newCall(okhttp3.Request.Builder().url(local).build()).execute().use { it.code in 200..399 }
+        }.getOrDefault(false)
+        DiagLog.w("LOGIN: $local ${if (ok) "可访问" else "不可访问"}")
+        return if (ok || found == null) local else found
+    }
+
     /**
      * Diagnostic for netdisk login: dump what a config-centre site (e.g. key=Wexconfig) returns from
      * homeContent / categoryContent / detailContent / playerContent, so the login mechanism (QR image,

@@ -44,7 +44,9 @@ class MainActivity : Activity() {
 
         val pick = Button(this).apply { text = "选择首页站点（服务中可直接切换）" }
         val pickEnabled = Button(this).apply { text = "选择启用站点（搜索 / 全部站点）" }
-        val probe = Button(this).apply { text = "探查配置中心（网盘登录）" }
+        val probe = Button(this).apply { text = "探查配置中心（诊断）" }
+        val panOnly = Button(this).apply { text = "只启用网盘站" }
+        val login = Button(this).apply { text = "网盘登录（扫码 / 密码）" }
 
         fun loadSites(btn: Button, onOk: (List<TvboxConfig.Site>) -> Unit) {
             val url = configUrl.text.toString().trim()
@@ -112,6 +114,44 @@ class MainActivity : Activity() {
                     .show()
             }
         }
+        panOnly.setOnClickListener {
+            loadSites(panOnly) { all ->
+                val sites = all.filter { SpiderHub.isSupported(it) }
+                val checked = BooleanArray(sites.size) { SpiderHub.isPan(sites[it]) }
+                android.app.AlertDialog.Builder(this).setTitle("网盘站（已按名称勾选 ${checked.count { it }} 个，可修改）")
+                    .setMultiChoiceItems(sites.map { "${it.name}  [${it.key}]" }.toTypedArray(), checked) { _, i, on -> checked[i] = on }
+                    .setPositiveButton("保存") { _, _ ->
+                        val chosen = sites.filterIndexed { i, _ -> checked[i] }
+                        if (chosen.isEmpty()) { append("\n没有勾选任何站点，未保存\n"); return@setPositiveButton }
+                        val set = chosen.map { it.key }.toSet()
+                        prefs.edit().putStringSet("enabledSites", set).apply()
+                        SpiderHub.enabled = set
+                        // The home site is always served, so it must be one of the netdisk sites too.
+                        val home = prefs.getString("siteKey", "")!!
+                        if (home !in set) {
+                            prefs.edit().putString("siteKey", chosen[0].key).apply()
+                            siteKey.setText(chosen[0].key)
+                            if (SpiderHub.ready) SpiderHub.setHome(chosen[0].key)
+                        }
+                        append("\n只启用网盘站 ${set.size} 个: ${chosen.joinToString { it.name }}\n首页站点=${prefs.getString("siteKey", "")}；SenPlayer 里刷新媒体库\n")
+                    }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+        }
+        login.setOnClickListener {
+            if (!SpiderHub.ready) { append("\n先启动 Jellyfin 服务，再登录网盘\n"); return@setOnClickListener }
+            login.isEnabled = false
+            append("\n正在启动配置中心…\n")
+            Thread({
+                val url = runCatching { SpiderHub.loginPageUrl() }.getOrNull()
+                main.post {
+                    login.isEnabled = true
+                    if (url == null) append("\n没找到配置中心登录页，请分享日志\n")
+                    else startActivity(Intent(this, LoginActivity::class.java).putExtra("url", url))
+                }
+            }, "login").start()
+        }
         val run = Button(this).apply { text = "Run" }
         val serve = Button(this).apply { text = "启动 Jellyfin 服务（全部站点，首页=当前站点）" }
         val share = Button(this).apply { text = "分享日志" }
@@ -130,7 +170,7 @@ class MainActivity : Activity() {
 
         // Controls scroll on their own so the log keeps half the screen on a phone.
         val controls = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        listOf(configUrl, pick, siteKey, pickEnabled, serve, probe, buttons, keyword, timeout, fakePkg, preload, forceStd, batch)
+        listOf(configUrl, pick, siteKey, pickEnabled, panOnly, serve, login, probe, buttons, keyword, timeout, fakePkg, preload, forceStd, batch)
             .forEach { controls.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
         root.addView(ScrollView(this).apply { addView(controls) }, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
