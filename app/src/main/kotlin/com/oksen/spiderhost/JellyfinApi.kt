@@ -37,7 +37,12 @@ object JellyfinApi {
     const val USER_ID = "8f3e2d1c0b9a48d7a6c5b4e3f2a1d0c9"
     const val TOKEN = "spiderhost0000000000000000000001"
     private const val VERSION = "10.10.7"
-    private const val SERVER_NAME = "SpiderHost"
+    /** Shown as the server name in SenPlayer, like 影视仓 shows the current site at the top. */
+    private val SERVER_NAME get() = SpiderHub.homeKey.takeIf { it.isNotBlank() }?.let { SpiderHub.shortName(it) } ?: "SpiderHost"
+    /** App prefs (spike); set by SpiderHostApp. */
+    @Volatile var prefs: android.content.SharedPreferences? = null
+    private val altSourcesOn get() = prefs?.getBoolean("altSources", false) == true
+    private const val REC_TID = "__rec__"
     private val base get() = "http://127.0.0.1:${LocalServer.PORT}"
 
     private val http = OkHttpClient.Builder().dns(Net.dns)
@@ -52,6 +57,7 @@ object JellyfinApi {
     private var idFile: File? = null
 
     fun init(dir: File) {
+        UserStore.init(dir)
         imgDir = File(dir, "jf-img").apply { mkdirs() }
         val f = File(dir, "jf-ids.tsv")
         idFile = f
@@ -155,8 +161,17 @@ object JellyfinApi {
             at(0) == "users" && at(2) == "views" -> json(views())
             at(0) == "userviews" -> json(views())
             at(0) == "users" && at(2) == "groupingoptions" -> json(JSONArray())
-            at(0) == "users" && at(2) == "items" && at(3) == "resume" -> json(queryResult(JSONArray(), 0))
-            at(0) == "useritems" && at(1) == "resume" -> json(queryResult(JSONArray(), 0))
+            at(0) == "users" && at(2) == "items" && at(3) == "resume" -> json(resume(q))
+            at(0) == "useritems" && at(1) == "resume" -> json(resume(q))
+            at(0) == "users" && at(2) == "items" && n == 5 && at(4) == "userdata" -> userDataRoute(s, seg[3], body)
+            at(0) == "useritems" && n == 3 && at(2) == "userdata" -> userDataRoute(s, seg[1], body)
+            at(0) == "users" && at(2) == "favoriteitems" && n >= 4 -> favoriteRoute(s, seg[3])
+            at(0) == "userfavoriteitems" && n >= 2 -> favoriteRoute(s, seg[1])
+            at(0) == "users" && at(2) == "playeditems" && n >= 4 -> playedRoute(s, seg[3])
+            at(0) == "userplayeditems" && n >= 2 -> playedRoute(s, seg[1])
+            at(0) == "users" && at(2) == "playingitems" && n >= 4 -> playingItemRoute(s, seg[3], at(4), q)
+            at(0) == "playingitems" && n >= 2 -> playingItemRoute(s, seg[1], at(2), q)
+            at(0) == "sessions" && at(1) == "playing" -> sessionPlaying(at(2), body)
             at(0) == "users" && at(2) == "items" && at(3) == "latest" -> json(latest(q))
             at(0) == "items" && at(1) == "latest" -> json(latest(q))
             at(0) == "users" && at(2) == "items" && n == 4 -> item(seg[3])
@@ -166,15 +181,13 @@ object JellyfinApi {
             at(0) == "items" && at(2) == "playbackinfo" -> json(playbackInfo(seg[1]))
             at(0) == "items" && at(2) == "images" -> image(seg[1])
             at(0) == "items" && (at(2) == "similar" || at(2) == "specialfeatures" || at(2) == "localtrailers" || at(2) == "thememedia") -> json(queryResult(JSONArray(), 0))
-            at(0) == "shows" && at(1) == "nextup" -> json(queryResult(JSONArray(), 0))
+            at(0) == "shows" && at(1) == "nextup" -> json(nextUp(q))
             at(0) == "shows" && at(2) == "seasons" -> json(seasons(seg[1]))
             at(0) == "shows" && at(2) == "episodes" -> json(episodes(seg[1], q["seasonid"]))
             at(0) == "search" && at(1) == "hints" -> json(searchHints(q))
             (at(0) == "videos" || at(0) == "audio") && n >= 3 -> stream(s, seg[1])
             at(0) == "genres" || at(0) == "studios" || at(0) == "persons" || at(0) == "artists" -> json(queryResult(JSONArray(), 0))
             at(0) == "sessions" -> noContent()
-            at(0) == "users" && (at(2) == "playeditems" || at(2) == "playingitems" || at(2) == "favoriteitems") -> json(userData(false))
-            at(0) == "userplayeditems" || at(0) == "userfavoriteitems" -> json(userData(false))
             at(0) == "branding" && at(1) == "configuration" -> json(JSONObject().put("LoginDisclaimer", "").put("CustomCss", "").put("SplashscreenEnabled", false))
             at(0) == "branding" -> text(Response.Status.OK, "")
             at(0) == "quickconnect" && at(1) == "enabled" -> json(false)
@@ -252,12 +265,25 @@ object JellyfinApi {
             .put("ServerId", SERVER_ID)
     }
 
-    private fun userData(played: Boolean) = JSONObject()
-        .put("PlaybackPositionTicks", 0)
-        .put("PlayCount", 0)
-        .put("IsFavorite", false)
-        .put("Played", played)
-        .put("Key", "")
+    /** UserData from the local store (收藏、进度、已看). */
+    private fun userData(id: String): JSONObject {
+        val p = UserStore.progress(id)
+        val o = JSONObject()
+            .put("PlaybackPositionTicks", p?.ticks ?: 0L)
+            .put("PlayCount", if (p?.played == true) 1 else 0)
+            .put("IsFavorite", UserStore.isFavorite(id))
+            .put("Played", p?.played == true)
+            .put("Key", id)
+            .put("ItemId", id)
+        if (p != null) {
+            o.put("LastPlayedDate", isoDate(p.at))
+            if (p.runtime > 0 && !p.played) o.put("PlayedPercentage", p.ticks * 100.0 / p.runtime)
+        }
+        return o
+    }
+
+    private fun isoDate(ms: Long): String = java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US)
+        .apply { timeZone = java.util.TimeZone.getTimeZone("UTC") }.format(java.util.Date(ms))
 
     // ---------- library ----------
 
@@ -265,7 +291,9 @@ object JellyfinApi {
     private fun views(): JSONObject {
         val arr = JSONArray()
         val home = SpiderHub.homeKey
-        SpiderHub.classesOf(home).forEach { (tid, name) -> arr.put(folderDto(viewId(home, tid), name, "CollectionFolder", "tvshows")) }
+        val classes = SpiderHub.classesOf(home)
+        if (home.isNotBlank() && SpiderHub.recommendNow(home) != null) arr.put(folderDto(viewId(home, REC_TID), "推荐", "CollectionFolder", "tvshows"))
+        classes.forEach { (tid, name) -> arr.put(folderDto(viewId(home, tid), name, "CollectionFolder", "tvshows")) }
         arr.put(folderDto(sitesRootId, "全部站点（${SpiderHub.served().size}）", "CollectionFolder", "folders"))
         return queryResult(arr, 0)
     }
@@ -281,7 +309,7 @@ object JellyfinApi {
         .put("ImageTags", JSONObject())
         .put("BackdropImageTags", JSONArray())
         .put("LocationType", "FileSystem")
-        .put("UserData", userData(false))
+        .put("UserData", userData(id))
 
     private fun siteFolders(): JSONArray {
         val arr = JSONArray()
@@ -307,7 +335,8 @@ object JellyfinApi {
         }
         val limit = q["limit"]?.toIntOrNull() ?: 16
         val arr = JSONArray()
-        category(site, tid, 1).first.take(limit).forEach { arr.put(seriesDto(it, null)) }
+        val list = if (tid == REC_TID) recommend(site) else category(site, tid, 1).first
+        list.take(limit).forEach { arr.put(seriesDto(it, null)) }
         return arr
     }
 
@@ -322,6 +351,7 @@ object JellyfinApi {
             searchEntries(term).forEach { arr.put(entryDto(it)) }
             return queryResult(arr, 0)
         }
+        if ("isfavorite" in q["filters"].orEmpty().lowercase() || q["isfavorite"] == "true") return favoritesResult(q)
         q["ids"]?.takeIf { it.isNotBlank() }?.let { list ->
             val arr = JSONArray()
             list.split(',').forEach { id -> dtoFor(id.trim())?.let { arr.put(it) } }
@@ -334,7 +364,9 @@ object JellyfinApi {
             "site" -> classFolders(parent[0]).let { queryResult(it, 0) }
             "view" -> {
                 val pageSize = q["limit"]?.toIntOrNull()?.takeIf { it > 0 }
-                val (list, total) = categoryWindow(parent[0], parent[2], start, pageSize)
+                val (list, total) = if (parent[2] == REC_TID) recommend(parent[0]).let { all ->
+                    all.drop(start).let { if (pageSize != null) it.take(pageSize) else it } to all.size
+                } else categoryWindow(parent[0], parent[2], start, pageSize)
                 val arr = JSONArray()
                 list.forEach { arr.put(seriesDto(it, null)) }
                 queryResult(arr, start, total)
@@ -359,11 +391,14 @@ object JellyfinApi {
             "sites" -> folderDto(sitesRootId, "全部站点", "CollectionFolder", "folders")
             "site" -> folderDto(siteFolderId(key[0]), SpiderHub.shortName(key[0]), "Folder", null, sitesRootId)
             "view" -> {
-                val name = SpiderHub.classesOf(key[0]).firstOrNull { it.first == key[2] }?.second ?: key[2]
+                val name = if (key[2] == REC_TID) "推荐" else SpiderHub.classesOf(key[0]).firstOrNull { it.first == key[2] }?.second ?: key[2]
                 if (key[0] == SpiderHub.homeKey) folderDto(viewId(key[0], key[2]), name, "CollectionFolder", "tvshows")
                 else folderDto(viewId(key[0], key[2]), name, "Folder", null, siteFolderId(key[0]))
             }
-            "series" -> detail(key[0], key[2])?.let { seriesDto(it.vod, it) } ?: vods[key[0] + "|" + key[2]]?.let { seriesDto(it, null) }
+            "series" -> detail(key[0], key[2])?.let { d ->
+                if (altSourcesOn) AltSources.start(id, d)
+                seriesDto(d.vod, d).apply { AltSources.ready(id)?.takeIf { it.isNotEmpty() }?.let { alts -> put("ChildCount", d.flags.size + alts.sumOf { it.flags.size }) } }
+            } ?: vods[key[0] + "|" + key[2]]?.let { seriesDto(it, null) }
             "group" -> groupDto(id, key)
             "season" -> detail(key[0], key[2])?.let { d -> seasonDto(d, key[3].toInt()) }
             "episode" -> detail(key[0], key[2])?.let { d -> episodeDto(d, key[3].toInt(), key[4].toInt(), withSources = true) }
@@ -381,7 +416,10 @@ object JellyfinApi {
             return queryResult(arr, 0)
         }
         val d = detail(key[0], key[2]) ?: return queryResult(JSONArray(), 0)
-        d.flags.indices.forEach { arr.put(seasonDto(d, it)) }
+        val alts = if (altSourcesOn) { AltSources.start(seriesIdStr, d); AltSources.await(seriesIdStr, 4_000) } else emptyList()
+        if (alts.isEmpty()) { d.flags.indices.forEach { arr.put(seasonDto(d, it)) }; return queryResult(arr, 0) }
+        var n = 0
+        (listOf(d) + alts).forEach { x -> x.flags.indices.forEach { arr.put(seasonDto(x, it, ++n)) } }
         return queryResult(arr, 0)
     }
 
@@ -396,7 +434,8 @@ object JellyfinApi {
             return queryResult(arr, 0)
         }
         val key = lookup(seriesIdStr) ?: return queryResult(JSONArray(), 0)
-        val list = if (key.getOrNull(1) == "group") groupDetails(seriesIdStr, key) else listOfNotNull(detail(key[0], key[2]))
+        val list = if (key.getOrNull(1) == "group") groupDetails(seriesIdStr, key)
+            else listOfNotNull(detail(key[0], key[2])) + (if (altSourcesOn) AltSources.ready(seriesIdStr).orEmpty() else emptyList())
         list.forEach { d -> d.flags.indices.forEach { f -> d.episodes.getOrNull(f)?.indices?.forEach { e -> arr.put(episodeDto(d, f, e, withSources = false)) } } }
         return queryResult(arr, 0)
     }
@@ -420,6 +459,262 @@ object JellyfinApi {
         return JSONObject().put("SearchHints", arr).put("TotalRecordCount", arr.length())
     }
 
+    // ---------- 推荐 / 评分 ----------
+
+    private const val POSTER_RATIO = 0.6667
+
+    /** The home site's 推荐 list (homeContent list or homeVideoContent). */
+    private fun recommend(site: String): List<Vod> = parseList(site, SpiderHub.recommendJson(site))
+
+    private val ratingRes = listOf(
+        Regex("""(?:评分|豆瓣|豆瓣评分|IMDb|imdb)\s*[:：]?\s*(10(?:\.0)?|\d(?:\.\d)?)"""),
+        Regex("""^\s*(10(?:\.0)?|\d(?:\.\d)?)\s*分\s*$"""),
+        Regex("""^\s*(10\.0|\d\.\d)\s*$"""),
+    )
+
+    /**
+     * A rating only when vod_remarks really is one (「评分8.7」「8.7分」「8.7」). Remarks like
+     * 「更新至10集」「HD」 are not ratings and give nothing, so no score is invented.
+     */
+    private fun ratingOf(remarks: String): Double? {
+        if (remarks.isBlank()) return null
+        for (r in ratingRes) r.find(remarks)?.let { m -> return m.groupValues[1].toDoubleOrNull()?.takeIf { it in 0.0..10.0 } }
+        return null
+    }
+
+    // ---------- 收藏 / 进度 ----------
+
+    /** A small picture of an item, kept with its favorite/progress so lists can be drawn without calling the site. */
+    private fun snapOf(id: String): UserStore.Snap? {
+        val nid = id.lowercase().replace("-", "")
+        val key = lookup(nid) ?: return null
+        return when (key.getOrNull(1)) {
+            "series" -> {
+                val k = key[0] + "|" + key[2]
+                val v = details[k]?.vod ?: vods[k] ?: detail(key[0], key[2])?.vod ?: return null
+                UserStore.Snap(nid, "series", v.name, knownPic(v.site, v.id) ?: v.pic, v.year)
+            }
+            "group" -> {
+                val g = groupVods(key)
+                val name = owners["${g[0].site}|${g[0].id}"]?.second ?: entryName(g)
+                UserStore.Snap(nid, "group", name, g.firstOrNull { it.pic.startsWith("http") }?.pic.orEmpty(), g.firstNotNullOfOrNull { it.year.takeIf { y -> y.isNotBlank() } }.orEmpty())
+            }
+            "episode" -> {
+                val d = detail(key[0], key[2]) ?: return null
+                val f = key[3].toInt(); val e = key[4].toInt()
+                UserStore.Snap(nid, "episode", d.episodes.getOrNull(f)?.getOrNull(e)?.first ?: "第${e + 1}集", d.vod.pic, d.vod.year,
+                    seriesId = ownerId(d), seriesName = ownerName(d), seasonId = seasonId(d.vod.site, d.vod.id, f),
+                    seasonName = seasonName(d, f), index = e + 1, parentIndex = f + 1)
+            }
+            "season" -> {
+                val d = detail(key[0], key[2]) ?: return null
+                UserStore.Snap(nid, "season", seasonName(d, key[3].toInt()), d.vod.pic, d.vod.year, seriesId = ownerId(d), seriesName = ownerName(d))
+            }
+            else -> null
+        }
+    }
+
+    private fun snapSeriesDto(s: UserStore.Snap) = JSONObject()
+        .put("Name", s.name)
+        .put("ServerId", SERVER_ID)
+        .put("Id", s.id)
+        .put("Type", "Series")
+        .put("IsFolder", true)
+        .put("MediaType", "Unknown")
+        .put("LocationType", "Remote")
+        .put("UserData", userData(s.id))
+        .put("ImageTags", imageTags(s.pic))
+        .put("BackdropImageTags", JSONArray())
+        .put("PrimaryImageAspectRatio", POSTER_RATIO)
+        .apply { s.year.toIntOrNull()?.let { put("ProductionYear", it) } }
+
+    private fun snapEpisodeDto(s: UserStore.Snap) = JSONObject()
+        .put("Name", s.name)
+        .put("ServerId", SERVER_ID)
+        .put("Id", s.id)
+        .put("Type", "Episode")
+        .put("IsFolder", false)
+        .put("MediaType", "Video")
+        .put("VideoType", "VideoFile")
+        .put("LocationType", "Remote")
+        .put("IndexNumber", s.index)
+        .put("ParentIndexNumber", s.parentIndex)
+        .put("SeasonId", s.seasonId)
+        .put("SeasonName", s.seasonName)
+        .put("SeriesId", s.seriesId)
+        .put("SeriesName", s.seriesName)
+        .put("ParentId", s.seasonId)
+        .put("UserData", userData(s.id))
+        .put("ImageTags", imageTags(s.pic))
+        .apply { if (s.pic.isNotBlank()) put("SeriesPrimaryImageTag", md5(s.pic).take(16)) }
+        .apply { UserStore.progress(s.id)?.runtime?.takeIf { it > 0 }?.let { put("RunTimeTicks", it) } }
+
+    private fun snapDto(s: UserStore.Snap): JSONObject = if (s.kind == "episode") snapEpisodeDto(s) else snapSeriesDto(s)
+
+    private fun limitOf(q: Map<String, String>, def: Int) = q["limit"]?.toIntOrNull()?.takeIf { it > 0 } ?: def
+
+    /** 继续观看: unfinished episodes, newest first, one per series. */
+    private fun resume(q: Map<String, String>): JSONObject {
+        val arr = JSONArray()
+        UserStore.resume().take(limitOf(q, 20)).forEach { arr.put(snapEpisodeDto(it.snap)) }
+        return queryResult(arr, 0)
+    }
+
+    /**
+     * 下一集: after a finished episode, the next one on the same line. Uses cached details, and loads at most
+     * 4 series in parallel within 8 s, so the home screen is never held up by a slow site.
+     */
+    private fun nextUp(q: Map<String, String>): JSONObject {
+        val only = q["seriesid"]?.lowercase()?.replace("-", "")?.takeIf { it.isNotBlank() }
+        val last = UserStore.lastWatched().filter { only == null || it.snap.seriesId == only }.take(limitOf(q, 20))
+        val keys = last.mapNotNull { p -> lookup(p.snap.id)?.takeIf { it.getOrNull(1) == "episode" }?.let { p to it } }
+        val needLoad = keys.filter { (_, k) -> details["${k[0]}|${k[2]}"] == null }.take(4).map { (_, k) -> "${k[0]}\u0002${k[2]}" }
+        if (needLoad.isNotEmpty()) SpiderHub.fanOut(needLoad, 8) { t -> detail(t.substringBefore('\u0002'), t.substringAfter('\u0002'), background = true) }
+        val arr = JSONArray()
+        keys.forEach { (_, k) ->
+            val d = details["${k[0]}|${k[2]}"] ?: return@forEach
+            val f = k[3].toInt(); val e = k[4].toInt() + 1
+            if (e < (d.episodes.getOrNull(f)?.size ?: 0)) {
+                val epId = episodeId(d.vod.site, d.vod.id, f, e)
+                if (UserStore.progress(epId)?.played != true) arr.put(episodeDto(d, f, e, withSources = false))
+            }
+        }
+        return queryResult(arr, 0)
+    }
+
+    private fun favoritesResult(q: Map<String, String>): JSONObject {
+        val types = q["includeitemtypes"].orEmpty().lowercase()
+        val all = UserStore.favorites().map { it.snap }.filter { s ->
+            types.isBlank() || when (s.kind) { "episode" -> "episode" in types; "season" -> "season" in types; else -> "series" in types }
+        }
+        val start = q["startindex"]?.toIntOrNull() ?: 0
+        val arr = JSONArray()
+        all.drop(start).take(limitOf(q, 200)).forEach { arr.put(snapDto(it)) }
+        return queryResult(arr, start, all.size)
+    }
+
+    private fun favoriteRoute(s: IHTTPSession, id: String): Response {
+        val nid = id.lowercase().replace("-", "")
+        val on = s.method != NanoHTTPD.Method.DELETE
+        if (on) {
+            val snap = snapOf(nid) ?: return text(Response.Status.NOT_FOUND, "unknown id $id")
+            UserStore.setFavorite(snap, true)
+        } else UserStore.setFavorite(UserStore.Snap(nid, "", "", "", ""), false)
+        return json(userData(nid))
+    }
+
+    private fun playedRoute(s: IHTTPSession, id: String): Response {
+        val nid = id.lowercase().replace("-", "")
+        val snap = snapOf(nid) ?: return text(Response.Status.NOT_FOUND, "unknown id $id")
+        if (snap.kind == "episode") UserStore.report(snap, null, null, s.method != NanoHTTPD.Method.DELETE)
+        DiagLog.w("USER ${if (s.method == NanoHTTPD.Method.DELETE) "标为未看" else "标为已看"} ${snap.kind} ${snap.name}")
+        return json(userData(nid))
+    }
+
+    /** Legacy /Users/{u}/PlayingItems/{id}[/Progress]?PositionTicks=… */
+    private fun playingItemRoute(s: IHTTPSession, id: String, sub: String?, q: Map<String, String>): Response {
+        val ticks = q["positionticks"]?.toLongOrNull()
+        recordProgress(id, ticks, null, if (s.method == NanoHTTPD.Method.DELETE || sub == "stopped") "停止" else if (sub == "progress") "进度" else "开始")
+        return noContent()
+    }
+
+    /** POST /Sessions/Playing, /Sessions/Playing/Progress, /Sessions/Playing/Stopped with PlaybackStartInfo-style JSON. */
+    private fun sessionPlaying(sub: String?, body: String): Response {
+        val o = runCatching { JSONObject(body) }.getOrNull()
+        val id = o?.optString("ItemId").orEmpty()
+        if (id.isBlank()) { DiagLog.w("USER Sessions/Playing/${sub.orEmpty()} 没有 ItemId: ${body.take(200)}"); return noContent() }
+        val ticks = o?.takeIf { it.has("PositionTicks") }?.optLong("PositionTicks")
+        val runtime = o?.optJSONObject("Item")?.optLong("RunTimeTicks")?.takeIf { it > 0 }
+            ?: o?.optLong("RunTimeTicks")?.takeIf { it > 0 }
+        recordProgress(id, ticks, runtime, when (sub) { "progress" -> "进度"; "stopped" -> "停止"; null -> "开始"; else -> sub.orEmpty() })
+        return noContent()
+    }
+
+    private val lastProgressLog = ConcurrentHashMap<String, Long>()
+
+    private fun recordProgress(id: String, ticks: Long?, runtime: Long?, what: String) {
+        val nid = id.lowercase().replace("-", "")
+        // Episodes only; the detail is already cached while it plays, so this rarely calls the site.
+        if (lookup(nid)?.getOrNull(1) != "episode") return
+        val snap = snapOf(nid) ?: return
+        UserStore.report(snap, ticks, runtime, null)
+        val now = System.currentTimeMillis()
+        if (what != "进度" || now - (lastProgressLog[nid] ?: 0) > 60_000) {
+            lastProgressLog[nid] = now
+            DiagLog.w("USER $what ${snap.seriesName} ${snap.name} 位置 ${(ticks ?: 0) / 10_000_000}s" + (runtime?.let { " / ${it / 10_000_000}s" } ?: ""))
+        }
+    }
+
+    /** GET or POST /Users/{u}/Items/{id}/UserData (UpdateUserItemDataDto). */
+    private fun userDataRoute(s: IHTTPSession, id: String, body: String): Response {
+        val nid = id.lowercase().replace("-", "")
+        if (s.method == NanoHTTPD.Method.POST) {
+            val o = runCatching { JSONObject(body) }.getOrNull()
+            if (o != null) {
+                if (o.has("IsFavorite")) {
+                    val on = o.optBoolean("IsFavorite")
+                    if (on) snapOf(nid)?.let { UserStore.setFavorite(it, true) }
+                    else UserStore.setFavorite(UserStore.Snap(nid, "", "", "", ""), false)
+                }
+                if (o.has("Played") || o.has("PlaybackPositionTicks")) {
+                    val snap = snapOf(nid)
+                    if (snap?.kind == "episode") UserStore.report(snap,
+                        o.takeIf { it.has("PlaybackPositionTicks") }?.optLong("PlaybackPositionTicks"), null,
+                        o.takeIf { it.has("Played") }?.optBoolean("Played"))
+                }
+            }
+        }
+        return json(userData(nid))
+    }
+
+    // ---------- 换源：详情里追加其他站点的同名片（设置里开启） ----------
+
+    /**
+     * Opening a detail starts a background search for the same title on the other enabled sites; their lines are
+     * appended as extra seasons 「站名 · 线路」. Seasons wait at most a few seconds for it, so a slow search never
+     * makes SenPlayer's detail page fail; what was not ready shows on the next open. Results are cached.
+     */
+    private object AltSources {
+        private const val MAX_ALTS = 5
+        private val jobs = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<List<Detail>>>()
+
+        private fun norm(id: String) = id.lowercase().replace("-", "")
+
+        fun start(rawId: String, d: Detail) {
+            val id = norm(rawId)
+            val fresh = java.util.concurrent.CompletableFuture<List<Detail>>()
+            if (jobs.putIfAbsent(id, fresh) != null) return
+            Thread({
+                val out = runCatching { find(id, d) }.onFailure { DiagLog.w("[JF] 换源失败 ${d.vod.name}: $it") }.getOrDefault(emptyList())
+                // Keep failures out of the cache so the next open tries again.
+                if (out.isEmpty()) jobs.remove(id, fresh)
+                fresh.complete(out)
+            }, "alt-sources").apply { isDaemon = true; start() }
+        }
+
+        fun ready(id: String): List<Detail>? = jobs[norm(id)]?.takeIf { it.isDone }?.getNow(emptyList())
+
+        fun await(id: String, ms: Long): List<Detail> =
+            runCatching { jobs[norm(id)]?.get(ms, TimeUnit.MILLISECONDS) }.getOrNull().orEmpty()
+
+        private fun find(id: String, d: Detail): List<Detail> {
+            val base = d.vod.name.substringBeforeLast(" · ")
+            val want = titleKey(base)
+            val hits = search(base).filter { it.site != d.vod.site && titleKey(it.name.substringBeforeLast(" · ")) == want }
+                .distinctBy { it.site }.take(MAX_ALTS)
+            if (hits.isEmpty()) { DiagLog.w("[JF] 换源「$base」其他站没有同名片"); return emptyList() }
+            val tags = hits.map { it.site + "\u0002" + it.id }
+            val got = SpiderHub.fanOut(tags, 15) { t -> detail(t.substringBefore('\u0002'), t.substringAfter('\u0002'), background = true) }.toMap()
+            val list = tags.mapNotNull { got[it] }.filter { it.flags.isNotEmpty() }
+            if (list.isNotEmpty()) {
+                val name = owners["${d.vod.site}|${d.vod.id}"]?.second ?: base
+                (listOf(d) + list).forEach { owners["${it.vod.site}|${it.vod.id}"] = id to name }
+            }
+            DiagLog.w("[JF] 换源「$base」找到 ${hits.size} 站，详情成功 ${list.size}：${list.joinToString { SpiderHub.shortName(it.vod.site) }}")
+            return list
+        }
+    }
+
     // ---------- DTOs ----------
 
     private fun seriesDto(v: Vod, d: Detail?): JSONObject = JSONObject()
@@ -430,9 +725,11 @@ object JellyfinApi {
         .put("IsFolder", true)
         .put("MediaType", "Unknown")
         .put("LocationType", "Remote")
-        .put("UserData", userData(false))
+        .put("UserData", userData(seriesId(v)))
         .put("ImageTags", imageTags(knownPic(v.site, v.id) ?: v.pic))
         .put("BackdropImageTags", JSONArray())
+        .put("PrimaryImageAspectRatio", POSTER_RATIO)
+        .apply { ratingOf(v.remarks)?.let { put("CommunityRating", it) } }
         .apply { v.year.toIntOrNull()?.let { put("ProductionYear", it) } }
         .apply { if (d != null) {
             put("Overview", d.content)
@@ -452,7 +749,7 @@ object JellyfinApi {
         .put("ParentId", ownerId(d))
         .put("ChildCount", d.episodes.getOrNull(f)?.size ?: 0)
         .put("LocationType", "Remote")
-        .put("UserData", userData(false))
+        .put("UserData", userData(seasonId(d.vod.site, d.vod.id, f)))
         .put("ImageTags", imageTags(d.vod.pic))
         .apply { if (d.vod.pic.isNotBlank()) put("SeriesPrimaryImageTag", md5(d.vod.pic).take(16)) }
 
@@ -474,7 +771,8 @@ object JellyfinApi {
             .put("SeriesId", ownerId(d))
             .put("SeriesName", ownerName(d))
             .put("ParentId", seasonId(d.vod.site, d.vod.id, f))
-            .put("UserData", userData(false))
+            .put("UserData", userData(id))
+            .apply { UserStore.progress(id)?.runtime?.takeIf { it > 0 }?.let { put("RunTimeTicks", it) } }
             .put("ImageTags", imageTags(d.vod.pic))
             .apply { if (d.vod.pic.isNotBlank()) put("SeriesPrimaryImageTag", md5(d.vod.pic).take(16)) }
             .apply { if (withSources) put("MediaSources", JSONArray().put(mediaSource(id, null, 0))) }
@@ -824,9 +1122,11 @@ object JellyfinApi {
         .put("IsFolder", true)
         .put("MediaType", "Unknown")
         .put("LocationType", "Remote")
-        .put("UserData", userData(false))
+        .put("UserData", userData(id))
         .put("ImageTags", imageTags(g.firstOrNull { it.pic.startsWith("http") }?.pic.orEmpty()))
         .put("BackdropImageTags", JSONArray())
+        .put("PrimaryImageAspectRatio", POSTER_RATIO)
+        .apply { g.firstNotNullOfOrNull { ratingOf(it.remarks) }?.let { put("CommunityRating", it) } }
         .apply { g.firstNotNullOfOrNull { it.year.toIntOrNull() }?.let { put("ProductionYear", it) } }
 
     private fun groupVods(key: List<String>): List<Vod> = membersOf(key).map { (s, v) ->

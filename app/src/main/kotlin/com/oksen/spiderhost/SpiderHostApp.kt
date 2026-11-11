@@ -27,6 +27,7 @@ class SpiderHostApp : Application() {
         Init.set(this)
         Proxy.set(LocalServer.PORT)
         JellyfinApi.init(filesDir)
+        JellyfinApi.prefs = getSharedPreferences("spike", MODE_PRIVATE)
         server = LocalServer()
         runCatching { server.start() }
             .onSuccess { DiagLog.w("LocalServer listening on 127.0.0.1:${LocalServer.PORT}") }

@@ -271,6 +271,17 @@ class MainActivity : Activity() {
         pan.addView(login, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         col.addView(pan, cardLp())
 
+        val browse = card()
+        browse.addView(label("SenPlayer 浏览", 18f, bold = true))
+        browse.addView(label("收藏和观看进度存在本机，SenPlayer 的「收藏」「继续观看」「下一集」读这里。", 13f, dim = true).apply { setPadding(0, dp(6), 0, dp(8)) })
+        browse.addView(CheckBox(this).apply {
+            text = "换源：详情里追加其他已启用站点的同名片（会搜索所有启用站点，较慢）"; textSize = 14f; setTextColor(c(R.color.on_bg))
+            buttonTintList = ColorStateList.valueOf(c(R.color.primary))
+            isChecked = prefs.getBoolean("altSources", false)
+            setOnCheckedChangeListener { _, on -> prefs.edit().putBoolean("altSources", on).apply() }
+        })
+        col.addView(browse, cardLp())
+
         val diag = card()
         diag.addView(label("诊断", 18f, bold = true))
         diag.addView(label("单站诊断用首页站点逐步运行 init / 首页 / 分类 / 搜索 / 详情 / 播放，结果写入日志。", 13f, dim = true).apply { setPadding(0, dp(6), 0, dp(10)) })

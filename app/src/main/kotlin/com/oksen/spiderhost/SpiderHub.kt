@@ -44,7 +44,7 @@ object SpiderHub {
 
     fun start(r: SpiderRunner, app: SpiderHostApp, url: String, root: JsonObject, all: List<TvboxConfig.Site>, home: String) {
         runner?.takeIf { it !== r }?.shutdownExecutor()
-        if (configUrl != url) { loaders.clear(); rts.clear(); failed.clear(); classes.clear() }
+        if (configUrl != url) { loaders.clear(); rts.clear(); failed.clear(); classes.clear(); homeLists.clear(); noRecommend.clear() }
         configUrl = url
         rootSpider = root.get("spider")?.takeIf { it.isJsonPrimitive }?.asString
         ctx = app
@@ -159,7 +159,46 @@ object SpiderHub {
         if (list.isEmpty()) DiagLog.w("HUB: $key homeContent 无分类: ${home?.take(500)}")
         // Only cache a real answer, so a transient failure is retried on the next browse.
         if (list.isNotEmpty()) classes[key] = list
+        // homeContent's own "list" is the site's 推荐 (what 影视仓 shows first); keep it for the 推荐 library.
+        if (home != null && hasList(home)) homeLists[key] = home
         return list
+    }
+
+    private val homeLists = ConcurrentHashMap<String, String>()
+
+    private fun hasList(json: String) = runCatching {
+        JsonParser.parseString(json).asJsonObject.getAsJsonArray("list").size() > 0
+    }.getOrDefault(false)
+
+    /**
+     * The site's 推荐 list as raw CatVod JSON: homeContent's "list", else homeVideoContent().
+     * Null when the site has none, so no empty 推荐 library is shown.
+     */
+    fun recommendJson(key: String): String? {
+        homeLists[key]?.let { return it }
+        if (classes[key] == null) classesOf(key)
+        homeLists[key]?.let { return it }
+        if (key in noRecommend) return null
+        val v = on(key, "homeVideoContent", 15) { it.homeVideoContent() }
+        if (v != null && hasList(v)) { homeLists[key] = v; return v }
+        // Only a real (non-null) empty answer means "this site has no 推荐"; a timeout is retried later.
+        if (v != null) noRecommend += key
+        return null
+    }
+
+    private val noRecommend = ConcurrentHashMap.newKeySet<String>()
+    private val recLoading = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Never blocks on homeVideoContent: returns what is known now and, if nothing is known yet, loads it
+     * in the background so the 推荐 library appears on the next refresh instead of delaying the library list.
+     */
+    fun recommendNow(key: String): String? {
+        homeLists[key]?.let { return it }
+        if (key !in noRecommend && recLoading.add(key)) pool.submit {
+            try { recommendJson(key) } finally { recLoading.remove(key) }
+        }
+        return null
     }
 
     /** Runs [block] for every key in parallel, returns what finished within [timeoutSec]. */
