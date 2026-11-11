@@ -79,6 +79,21 @@ object JellyfinApi {
     private val sitesRootId get() = idOf("_", "sites")
     private fun siteFolderId(site: String) = idOf(site, "site")
     private fun seriesId(v: Vod) = seriesId(v.site, v.id)
+    /** Search results with the same title from several sites, merged into one entry (like 影视仓's 多个源). */
+    private fun groupId(members: List<Vod>) = idOf("_", "group", *members.map { it.site + "\u0002" + it.id }.toTypedArray())
+    private fun membersOf(key: List<String>): List<Pair<String, String>> =
+        key.drop(2).map { it.substringBefore('\u0002') to it.substringAfter('\u0002') }
+
+    /** site|vodId -> (group id, group name) once that vod has been shown inside a merged entry. */
+    private val owners = ConcurrentHashMap<String, Pair<String, String>>()
+    private fun ownerId(d: Detail) = owners["${d.vod.site}|${d.vod.id}"]?.first ?: seriesId(d.vod)
+    private fun ownerName(d: Detail) = owners["${d.vod.site}|${d.vod.id}"]?.second ?: d.vod.name
+    private fun seasonName(d: Detail, f: Int): String {
+        val line = d.flags.getOrElse(f) { "线路${f + 1}" }
+        if (owners["${d.vod.site}|${d.vod.id}"] == null) return line
+        val rem = d.vod.remarks.takeIf { it.isNotBlank() }?.let { "（$it）" }.orEmpty()
+        return "${SpiderHub.shortName(d.vod.site)} · $line$rem"
+    }
 
     // ---------- caches ----------
 
@@ -302,7 +317,7 @@ object JellyfinApi {
             // Everything we return is a Series; a search for only People/Episodes/etc gets nothing instead of duplicates.
             if (types.isNotBlank() && "series" !in types) return queryResult(JSONArray(), 0)
             val arr = JSONArray()
-            search(term).forEach { arr.put(seriesDto(it, null)) }
+            searchEntries(term).forEach { arr.put(entryDto(it)) }
             return queryResult(arr, 0)
         }
         q["ids"]?.takeIf { it.isNotBlank() }?.let { list ->
@@ -322,7 +337,7 @@ object JellyfinApi {
                 list.forEach { arr.put(seriesDto(it, null)) }
                 queryResult(arr, start, total)
             }
-            "series" -> seasons(parentId)
+            "series", "group" -> seasons(parentId)
             "season" -> episodes(seriesId(parent[0], parent[2]), parentId)
             else -> {
                 DiagLog.w("[JF] /Items without known ParentId/SearchTerm/Ids -> empty (params=${q.keys})")
@@ -347,6 +362,7 @@ object JellyfinApi {
                 else folderDto(viewId(key[0], key[2]), name, "Folder", null, siteFolderId(key[0]))
             }
             "series" -> detail(key[0], key[2])?.let { seriesDto(it.vod, it) } ?: vods[key[0] + "|" + key[2]]?.let { seriesDto(it, null) }
+            "group" -> groupDto(id, key)
             "season" -> detail(key[0], key[2])?.let { d -> seasonDto(d, key[3].toInt()) }
             "episode" -> detail(key[0], key[2])?.let { d -> episodeDto(d, key[3].toInt(), key[4].toInt(), withSources = true) }
             else -> null
@@ -355,31 +371,44 @@ object JellyfinApi {
 
     private fun seasons(seriesIdStr: String): JSONObject {
         val key = lookup(seriesIdStr) ?: return queryResult(JSONArray(), 0)
-        val d = detail(key[0], key[2]) ?: return queryResult(JSONArray(), 0)
         val arr = JSONArray()
+        if (key.getOrNull(1) == "group") {
+            // One season per (site, line): 「站名 · 线路（备注）」, numbered across all sites.
+            var n = 0
+            groupDetails(seriesIdStr, key).forEach { d -> d.flags.indices.forEach { arr.put(seasonDto(d, it, ++n)) } }
+            return queryResult(arr, 0)
+        }
+        val d = detail(key[0], key[2]) ?: return queryResult(JSONArray(), 0)
         d.flags.indices.forEach { arr.put(seasonDto(d, it)) }
         return queryResult(arr, 0)
     }
 
     private fun episodes(seriesIdStr: String, seasonIdStr: String?): JSONObject {
-        val key = lookup(seriesIdStr) ?: return queryResult(JSONArray(), 0)
-        val d = detail(key[0], key[2]) ?: return queryResult(JSONArray(), 0)
-        val season = seasonIdStr?.let { lookup(it) }?.takeIf { it.getOrNull(1) == "season" }?.get(3)?.toIntOrNull()
         val arr = JSONArray()
-        val flagIdx = if (season != null) listOf(season) else d.flags.indices.toList()
-        flagIdx.forEach { f -> d.episodes.getOrNull(f)?.indices?.forEach { e -> arr.put(episodeDto(d, f, e, withSources = false)) } }
+        val sk = seasonIdStr?.let { lookup(it) }?.takeIf { it.getOrNull(1) == "season" }
+        if (sk != null) {
+            // The season id names its own site and vod, so this works for merged entries too.
+            val d = detail(sk[0], sk[2]) ?: return queryResult(JSONArray(), 0)
+            val f = sk[3].toInt()
+            d.episodes.getOrNull(f)?.indices?.forEach { e -> arr.put(episodeDto(d, f, e, withSources = false)) }
+            return queryResult(arr, 0)
+        }
+        val key = lookup(seriesIdStr) ?: return queryResult(JSONArray(), 0)
+        val list = if (key.getOrNull(1) == "group") groupDetails(seriesIdStr, key) else listOfNotNull(detail(key[0], key[2]))
+        list.forEach { d -> d.flags.indices.forEach { f -> d.episodes.getOrNull(f)?.indices?.forEach { e -> arr.put(episodeDto(d, f, e, withSources = false)) } } }
         return queryResult(arr, 0)
     }
 
     private fun searchHints(q: Map<String, String>): JSONObject {
         val term = q["searchterm"].orEmpty()
         val arr = JSONArray()
-        if (term.isNotBlank()) search(term).forEach { v ->
-            val id = seriesId(v)
+        if (term.isNotBlank()) searchEntries(term).forEach { g ->
+            val v = g.first()
+            val id = if (g.size == 1) seriesId(v) else groupId(g)
             arr.put(JSONObject()
                 .put("ItemId", id)
                 .put("Id", id)
-                .put("Name", v.name)
+                .put("Name", entryName(g))
                 .put("Type", "Series")
                 .put("IsFolder", true)
                 .put("MediaType", "Unknown")
@@ -409,16 +438,16 @@ object JellyfinApi {
             put("People", people(d))
         } }
 
-    private fun seasonDto(d: Detail, f: Int): JSONObject = JSONObject()
-        .put("Name", d.flags.getOrElse(f) { "线路${f + 1}" })
+    private fun seasonDto(d: Detail, f: Int, index: Int = f + 1): JSONObject = JSONObject()
+        .put("Name", seasonName(d, f))
         .put("ServerId", SERVER_ID)
         .put("Id", seasonId(d.vod.site, d.vod.id, f))
         .put("Type", "Season")
         .put("IsFolder", true)
-        .put("IndexNumber", f + 1)
-        .put("SeriesId", seriesId(d.vod))
-        .put("SeriesName", d.vod.name)
-        .put("ParentId", seriesId(d.vod))
+        .put("IndexNumber", index)
+        .put("SeriesId", ownerId(d))
+        .put("SeriesName", ownerName(d))
+        .put("ParentId", ownerId(d))
         .put("ChildCount", d.episodes.getOrNull(f)?.size ?: 0)
         .put("LocationType", "Remote")
         .put("UserData", userData(false))
@@ -439,9 +468,9 @@ object JellyfinApi {
             .put("IndexNumber", e + 1)
             .put("ParentIndexNumber", f + 1)
             .put("SeasonId", seasonId(d.vod.site, d.vod.id, f))
-            .put("SeasonName", d.flags.getOrElse(f) { "线路${f + 1}" })
-            .put("SeriesId", seriesId(d.vod))
-            .put("SeriesName", d.vod.name)
+            .put("SeasonName", seasonName(d, f))
+            .put("SeriesId", ownerId(d))
+            .put("SeriesName", ownerName(d))
             .put("ParentId", seasonId(d.vod.site, d.vod.id, f))
             .put("UserData", userData(false))
             .put("ImageTags", imageTags(d.vod.pic))
@@ -585,6 +614,10 @@ object JellyfinApi {
     private fun image(id: String): Response {
         val key = lookup(id) ?: return text(Response.Status.NOT_FOUND, "unknown id")
         val kind = key.getOrNull(1)
+        if (kind == "group") {
+            val pic = membersOf(key).firstNotNullOfOrNull { (s, v) -> vods["$s|$v"]?.pic?.takeIf { it.startsWith("http") } }
+            return if (pic != null) redirect(pic) else text(Response.Status.NOT_FOUND, "no image")
+        }
         if (kind != "series" && kind != "season" && kind != "episode") return text(Response.Status.NOT_FOUND, "no image")
         val k = key[0] + "|" + key[2]
         val pic = (vods[k]?.pic ?: details[k]?.vod?.pic).orEmpty()
@@ -609,6 +642,79 @@ object JellyfinApi {
         val list = keys.flatMap { k -> byKey[k].orEmpty().map { it.copy(name = "${it.name} · ${SpiderHub.shortName(k)}") } }
         DiagLog.w("[JF] 搜索「$term」${keys.size} 站，${results.count { it.second.isNotEmpty() }} 站有结果，共 ${list.size} 条，用时 ${System.currentTimeMillis() - started} ms")
         if (list.isNotEmpty()) searches[term] = SearchHit(System.currentTimeMillis(), list)
+        return list
+    }
+
+    /** Title key for merging: case, full-width forms, spaces and punctuation ignored. */
+    private fun titleKey(name: String) = name.lowercase()
+        .map { c -> if (c in '\uFF01'..'\uFF5E') (c - 0xFEE0) else c }
+        .filter { it.isLetterOrDigit() }.joinToString("")
+
+    /** Search results grouped by title, config order kept; each entry is one vod or several from different sites. */
+    private fun searchEntries(term: String): List<List<Vod>> {
+        val groups = LinkedHashMap<String, MutableList<Vod>>()
+        search(term).forEach { v -> groups.getOrPut(titleKey(v.name.substringBeforeLast(" · "))) { mutableListOf() } += v }
+        return groups.values.map { g -> g.take(MAX_GROUP) }
+    }
+
+    private const val MAX_GROUP = 16
+
+    private fun entryName(g: List<Vod>): String =
+        if (g.size == 1) g[0].name else "${g[0].name.substringBeforeLast(" · ")} [${g.size}源]"
+
+    private fun entryDto(g: List<Vod>): JSONObject {
+        if (g.size == 1) return seriesDto(g[0], null)
+        val id = groupId(g)
+        val name = entryName(g)
+        g.forEach { owners["${it.site}|${it.id}"] = id to name }
+        return groupBase(id, name, g)
+    }
+
+    private fun groupBase(id: String, name: String, g: List<Vod>) = JSONObject()
+        .put("Name", name)
+        .put("ServerId", SERVER_ID)
+        .put("Id", id)
+        .put("Type", "Series")
+        .put("IsFolder", true)
+        .put("MediaType", "Unknown")
+        .put("LocationType", "Remote")
+        .put("UserData", userData(false))
+        .put("ImageTags", imageTags(g.firstOrNull { it.pic.startsWith("http") }?.pic.orEmpty()))
+        .put("BackdropImageTags", JSONArray())
+        .apply { g.firstNotNullOfOrNull { it.year.toIntOrNull() }?.let { put("ProductionYear", it) } }
+
+    private fun groupVods(key: List<String>): List<Vod> = membersOf(key).map { (s, v) ->
+        vods["$s|$v"] ?: Vod(s, v, "", "", "", "")
+    }
+
+    private fun groupDto(id: String, key: List<String>): JSONObject {
+        val g = groupVods(key)
+        val name = owners["${g[0].site}|${g[0].id}"]?.second ?: "${g[0].name.substringBeforeLast(" · ")} [${g.size}源]"
+        g.forEach { owners.putIfAbsent("${it.site}|${it.id}", id to name) }
+        val base = groupBase(id, name, g)
+        val ds = groupDetails(id, key)
+        val first = ds.firstOrNull { it.content.isNotBlank() } ?: ds.firstOrNull()
+        if (first != null) {
+            base.put("Overview", "来源：" + ds.joinToString("、") { SpiderHub.shortName(it.vod.site) } + "\n\n" + first.content)
+            base.put("ChildCount", ds.sumOf { it.flags.size })
+            base.put("People", people(first))
+        }
+        return base
+    }
+
+    private val groupCache = ConcurrentHashMap<String, List<Detail>>()
+
+    /** Details of every site in a merged entry, fetched in parallel; sites that fail or time out are left out. */
+    private fun groupDetails(id: String, key: List<String>): List<Detail> {
+        groupCache[id]?.let { return it }
+        val members = membersOf(key)
+        val name = owners["${members[0].first}|${members[0].second}"]
+        members.forEach { (s, v) -> owners.putIfAbsent("$s|$v", name ?: (id to (vods["$s|$v"]?.name ?: ""))) }
+        val tags = members.map { it.first + "\u0002" + it.second }
+        val got = SpiderHub.fanOut(tags, 30) { t -> detail(t.substringBefore('\u0002'), t.substringAfter('\u0002')) }.toMap()
+        val list = tags.mapNotNull { got[it] }
+        DiagLog.w("[JF] 合并条目 ${members.size} 源，详情成功 ${list.size}")
+        if (list.size == members.size) groupCache[id] = list
         return list
     }
 
