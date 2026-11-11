@@ -25,15 +25,15 @@ class PlayProbe(
         .followRedirects(false)
         .build()
 
-    fun run(search: String?, home: String?) {
+    fun run(search: String?, home: String?): String {
         val vodId = firstVodId(search) ?: firstVodId(home)
-        if (vodId == null) { DiagLog.w("PROBE: 搜索和首页都没有 vod_id，跳过播放验证"); return }
+        if (vodId == null) { DiagLog.w("PROBE: 搜索和首页都没有 vod_id，跳过播放验证"); return "无 vod_id" }
 
         step("12 detailContent([$vodId])")
         val detail = callFn("detailContent", loader) { spider.detailContent(listOf(vodId)) }
         DiagLog.w("detailContent length=${detail?.length}\n${detail?.take(3000)}")
         val vod = runCatching { JsonParser.parseString(detail).asJsonObject.getAsJsonArray("list")[0].asJsonObject }.getOrNull()
-        if (vod == null) { DiagLog.w("PROBE: detail 没有 list[0]"); return }
+        if (vod == null) { DiagLog.w("PROBE: detail 没有 list[0]"); return "detail 无 list" }
         DiagLog.w("detail 字段: ${vod.keySet().joinToString()}")
 
         val froms = vod.s("vod_play_from").split("$$$")
@@ -59,13 +59,14 @@ class PlayProbe(
             DiagLog.w("parse=$parse jx=$jx headers=$headers url=${url.take(300)}")
             val verdict = when {
                 parse == 1 || jx == 1 -> "不兼容（parse/jx=1，需要解析/嗅探）"
-                url.isBlank() -> "无 url"
+                url.isBlank() -> "无 url" + (p.get("msg")?.takeIf { it.isJsonPrimitive }?.asString?.let { "（$it）" } ?: "")
                 url.startsWith("http") -> probe(url, headers)
                 else -> "非 http url（${url.substringBefore(':').take(20)}），需另行处理"
             }
             summary += "[$i] $flag: $verdict"
         }
         DiagLog.w("PROBE 结论:\n  " + summary.joinToString("\n  "))
+        return summary.joinToString("; ").ifBlank { "无线路" }
     }
 
     private fun probe(url: String, headers: Map<String, String>): String {

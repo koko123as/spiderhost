@@ -36,6 +36,7 @@ class MainActivity : Activity() {
         val timeout = field("单次调用超时（秒）", prefs.getString("timeout", "30")!!, InputType.TYPE_CLASS_NUMBER)
         val fakePkg = CheckBox(this).apply { text = "伪装包名为 com.github.tvbox.osc（实验）"; isChecked = prefs.getBoolean("fakePkg", false) }
         val preload = CheckBox(this).apply { text = "预先 System.load 解出的 .so（实验）"; isChecked = prefs.getBoolean("preload", false) }
+        val batch = CheckBox(this).apply { text = "批量：测同一 jar 的全部站点（忽略站点 key 以外的单站流程）"; isChecked = prefs.getBoolean("batch", false) }
         val forceStd = CheckBox(this).apply { text = "强制标准 Init.init（可能被杀进程）"; isChecked = prefs.getBoolean("forceStd", false) }
 
         val pick = Button(this).apply { text = "从配置选择站点" }
@@ -76,7 +77,7 @@ class MainActivity : Activity() {
         }
         scroll = ScrollView(this).apply { addView(output) }
 
-        listOf(configUrl, pick, siteKey, keyword, timeout, fakePkg, preload, forceStd, buttons)
+        listOf(configUrl, pick, siteKey, keyword, timeout, fakePkg, preload, forceStd, batch, buttons)
             .forEach { root.addView(it, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)) }
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         setContentView(root)
@@ -95,6 +96,7 @@ class MainActivity : Activity() {
                 .putBoolean("fakePkg", fakePkg.isChecked)
                 .putBoolean("preload", preload.isChecked)
                 .putBoolean("forceStd", forceStd.isChecked)
+                .putBoolean("batch", batch.isChecked)
                 .apply()
             val opts = SpiderRunner.Options(
                 configUrl = configUrl.text.toString().trim(),
@@ -104,6 +106,7 @@ class MainActivity : Activity() {
                 fakeTvboxPackage = fakePkg.isChecked,
                 preloadSo = preload.isChecked,
                 forceStandardInit = forceStd.isChecked,
+                batch = batch.isChecked,
             )
             running = true
             run.isEnabled = false

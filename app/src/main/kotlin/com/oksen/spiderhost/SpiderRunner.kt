@@ -37,6 +37,7 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         val preloadSo: Boolean = false,
         val forceStandardInit: Boolean = false,
         val maxFlags: Int = 3,
+        val batch: Boolean = false,
     )
 
     private val http = OkHttpClient.Builder()
@@ -45,7 +46,9 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         .build()
 
     // One dedicated thread per run: if a spider call hangs we abandon it and the next run gets a fresh one.
-    private val executor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+    private var executor: ExecutorService = newExecutor()
+
+    private fun newExecutor(): ExecutorService = Executors.newSingleThreadExecutor { r ->
         Thread(r, "spider-call").apply { isDaemon = true }
     }
 
@@ -128,6 +131,8 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
         step("7 Init")
         call("Init", loader) { initJar(loader, ctx, isProtected) }
 
+        if (opts.batch) { runBatch(sites, site, rawJar, loader, ctx); return }
+
         step("8 instantiate ${site.api}")
         val className = "com.github.catvod.spider." + site.api.removePrefix("csp_")
         val spider = call("newInstance $className", loader) {
@@ -157,6 +162,34 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
 
         PlayProbe(spider, loader, opts.maxFlags, { step(it) }, { l, c, b -> call(l, c, b) }).run(search, home)
     }
+
+    /** Stage 1b: every type-3 site that uses the same jar -> init, search, detail, player, probe. One summary line per site. */
+    private fun runBatch(sites: List<TvboxConfig.Site>, first: TvboxConfig.Site, rawJar: String, loader: ClassLoader, ctx: Context) {
+        val sameJar = sites.filter { it.type == 3 && it.api.startsWith("csp_") && (it.jarRaw ?: rawJar) == rawJar }
+        DiagLog.w("BATCH: 同一 jar 的 type-3 站点 ${sameJar.size} 个（总 ${sites.size}）")
+        sites.filter { it.name.contains("配置") || it.name.contains("设置") || it.key.contains("config", true) }
+            .forEach { DiagLog.w("可能的配置中心: key=${it.key} name=${it.name} api=${it.api} ext=${it.ext.take(200)}") }
+        val lines = mutableListOf<String>()
+        sameJar.forEachIndexed { idx, s ->
+            step("B$idx ${s.key}")
+            val className = "com.github.catvod.spider." + s.api.removePrefix("csp_")
+            val sp = call("new ${s.key}", loader) { loader.loadClass(className).getDeclaredConstructor().newInstance() as Spider }
+            if (sp == null) { lines += "${s.key} | ${s.name} | 实例化失败"; return@forEachIndexed }
+            sp.siteKey = s.key
+            SpiderSession.spider = sp; SpiderSession.siteKey = s.key
+            val ext = runCatching { TvboxConfig.resolveExt(s.ext, opts.configUrl) }.getOrDefault(s.ext)
+            call("init ${s.key}", loader) { try { sp.init(ctx, ext) } catch (e: AbstractMethodError) { sp.init(ctx) } }
+            val search = call("search ${s.key}", loader) { sp.searchContent(opts.keyword, false) }
+            val home = if (firstId(search) == null) call("home ${s.key}", loader) { sp.homeContent(true) } else null
+            val verdict = PlayProbe(sp, loader, opts.maxFlags, { step(it) }, { l, c, b -> call(l, c, b) }).run(search, home)
+            lines += "${s.key} | ${s.name} | search=${if (firstId(search) != null) "有" else "无"} | $verdict"
+        }
+        DiagLog.w("BATCH 结论（key | name | 搜索 | 各线路）:\n" + lines.joinToString("\n"))
+    }
+
+    private fun firstId(json: String?): String? = runCatching {
+        com.google.gson.JsonParser.parseString(json).asJsonObject.getAsJsonArray("list")[0].asJsonObject.get("vod_id").asString
+    }.getOrNull()
 
     /** Init strategy adapted from Kototoro TVBoxJarSpiderRuntime.initializeJar (Apache-2.0). */
     private fun initJar(loader: ClassLoader, ctx: Context, isProtected: Boolean) {
@@ -217,6 +250,8 @@ class SpiderRunner(private val app: SpiderHostApp, private val opts: Options) {
             }
         } catch (e: TimeoutException) {
             future.cancel(true)
+            // A hung spider thread would block every later call; abandon it and start a fresh one.
+            executor.shutdownNow(); executor = newExecutor()
             DiagLog.w("[$label] TIMEOUT after ${opts.timeoutSec}s")
             null
         } catch (e: java.util.concurrent.ExecutionException) {

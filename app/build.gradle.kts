@@ -11,15 +11,27 @@ android {
         applicationId = "com.oksen.spiderhost"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.0.1-spike"
+        versionCode = 2
+        versionName = "0.0.2-spike"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
     }
 
+    // Fixed debug key committed on purpose (self-use debug builds only), so each CI build installs over the last one.
+    signingConfigs {
+        getByName("debug") {
+            storeFile = file("debug.p12")
+            storeType = "pkcs12"
+            storePassword = "android"
+            keyAlias = "spiderhostdebug"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         debug {
+            signingConfig = signingConfigs.getByName("debug")
             // Spike: no shrinking, so host CatVod / QuickJS stub classes keep their exact names.
             isMinifyEnabled = false
         }
