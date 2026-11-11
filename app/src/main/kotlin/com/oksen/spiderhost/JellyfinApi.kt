@@ -346,7 +346,7 @@ object JellyfinApi {
                 if (key[0] == SpiderHub.homeKey) folderDto(viewId(key[0], key[2]), name, "CollectionFolder", "tvshows")
                 else folderDto(viewId(key[0], key[2]), name, "Folder", null, siteFolderId(key[0]))
             }
-            "series" -> detail(key[0], key[2])?.let { seriesDto(it.vod, it) }
+            "series" -> detail(key[0], key[2])?.let { seriesDto(it.vod, it) } ?: vods[key[0] + "|" + key[2]]?.let { seriesDto(it, null) }
             "season" -> detail(key[0], key[2])?.let { d -> seasonDto(d, key[3].toInt()) }
             "episode" -> detail(key[0], key[2])?.let { d -> episodeDto(d, key[3].toInt(), key[4].toInt(), withSources = true) }
             else -> null
@@ -651,9 +651,35 @@ object JellyfinApi {
         return out.take(want) to maxOf(total, start + out.size)
     }
 
+    private val inflight = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Detail?>>()
+
+    /**
+     * SenPlayer opens a detail page with several requests at once (item, seasons, episodes...).
+     * Without this, each one called detailContent on the spider in parallel; one slow or failed call
+     * made SenPlayer show 详情加载失败. Now concurrent callers share one call, and a failure is retried once.
+     */
     private fun detail(site: String, vodId: String): Detail? {
         val k = "$site|$vodId"
         details[k]?.let { return it }
+        val mine = java.util.concurrent.CompletableFuture<Detail?>()
+        val existing = inflight.putIfAbsent(k, mine)
+        if (existing != null) return runCatching { existing.get(70, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull()
+        try {
+            val d = loadDetail(site, vodId) ?: run {
+                DiagLog.w("[JF] detail $k 第一次失败，重试一次")
+                loadDetail(site, vodId)
+            }
+            mine.complete(d)
+            return d
+        } catch (t: Throwable) {
+            mine.complete(null); throw t
+        } finally {
+            inflight.remove(k, mine)
+        }
+    }
+
+    private fun loadDetail(site: String, vodId: String): Detail? {
+        val k = "$site|$vodId"
         val res = SpiderHub.on(site, "detailContent($vodId)") { it.detailContent(listOf(vodId)) }
         val o = runCatching { JsonParser.parseString(res).asJsonObject.getAsJsonArray("list")[0].asJsonObject }.getOrNull()
             ?: run { DiagLog.w("[JF] detail 无 list[0]: ${res?.take(300)}"); return null }
